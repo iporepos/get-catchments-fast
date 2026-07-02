@@ -14,9 +14,9 @@ batching step; grid layers are simply loaded once up front and reused.
 
 Usage:
 
-    python delineate_upstream.py --spec spec.json
-    python delineate_upstream.py --spec spec.json --outlet-id 3
-    python delineate_upstream.py --spec spec.json --dry-run
+    python get_catchments_fast.py --spec spec.json
+    python get_catchments_fast.py --spec spec.json --outlet-id 3
+    python get_catchments_fast.py --spec spec.json --dry-run
 
 """
 import argparse
@@ -50,10 +50,17 @@ def load_spec(spec_path: Path) -> dict:
     if missing:
         raise ValueError(f"Spec is missing required key(s): {missing}")
 
-    # Optional: name of a pre-computed area column already present on the grid
-    # (e.g. HydroBASINS' "SUB_AREA", in km^2). When set, this column is carried
-    # through and summed on every dissolve. Leave null/omit if the grid has none.
-    spec.setdefault("area_field", None)
+    # area_field is MANDATORY: the accept-vector-approximation-or-refine-with-DEM
+    # decision needs an actual area comparison between catchment_lower and
+    # catchment_upper, and there's no reliable fallback (compute_area_crs alone
+    # would mean recomputing geometry on every dissolve just to make this call,
+    # which isn't the "fast" path this script is for).
+    if not spec.get("area_field"):
+        raise ValueError(
+            "area_field is required - it's used to decide whether the vector "
+            "approximation (catchment_upper) is already good enough, or whether "
+            "DEM-based refinement is needed."
+        )
 
     # Optional: an equal-area CRS (e.g. "ESRI:102033" for South America Albers
     # Equal Area Conic). When set, a fresh geometric area is also computed on
@@ -63,16 +70,64 @@ def load_spec(spec_path: Path) -> dict:
     if spec["area_units"] not in ("km2", "m2"):
         raise ValueError("area_units must be 'km2' or 'm2'")
 
+    # Maximum acceptable gap between catchment_lower and catchment_upper, as a
+    # percent (e.g. 5.0 means: if catchment_lower's area is at least 95% of
+    # catchment_upper's, the vector-only upper approximation is accepted as the
+    # final "catchment" outright, and DEM refinement is skipped entirely (even
+    # if a dem_path is configured) - that's the whole point of "fast": only pay
+    # for raster processing on outlets where the vector bracket is too loose.
+    spec.setdefault("catchment_acceptable_error_pct", 5.0)
+
+    # Filename (not full path) for the combined output GeoPackage, written
+    # to dst_dir once all outlets are processed. Collects every outlet's
+    # final catchment/catchment_upper/catchment_lower into single layers,
+    # plus an 'outlets' layer with area/area_upper/area_lower attributes -
+    # a single-file summary instead of hunting through per-outlet folders.
+    spec.setdefault("aggregated_output", "catchments.gpkg")
+
     # Optional: path to an EXISTING DEM raster (e.g. a MERIT Hydro tile).
-    # When set, each outlet gets a small DEM clip around its finest-level
-    # local basin, as the first building block toward a raster-refined
-    # "middle" catchment estimate. Left null/omitted, this step is skipped
-    # entirely - no raster dependency is needed unless this is set.
+    # Only used if the vector approximation isn't within
+    # catchment_acceptable_error_pct - when needed, each outlet gets a small
+    # DEM clip around its finest-level local basin, from which a raster-
+    # derived catchment is delineated and becomes the final "catchment".
+    # Left null/omitted, refinement is never available - outlets that fail
+    # the tolerance check just fall back to catchment_upper.
+    #
+    # dem_path has two modes:
+    #   - Single file (legacy): dem_path points directly at one DEM raster.
+    #   - Tiled (when dem_tile_index_db is also set): dem_path is a FOLDER
+    #     of tile files. For each outlet, the tiles intersecting its clip
+    #     extent are found via dem_tile_index_db/layer, merged into one
+    #     raster, and THAT gets clipped - same clip_dem_to_bbox as before,
+    #     just fed a freshly-merged mosaic instead of a single static file.
     spec.setdefault("dem_path", None)
+    spec.setdefault("dem_tile_index_db", None)
+    spec.setdefault("dem_tile_index_layer", None)
+    spec.setdefault("dem_tile_field", None)
+    spec.setdefault("dem_file_pattern", None)
+
+    dem_tiled_mode = spec["dem_tile_index_db"] is not None
+    if dem_tiled_mode:
+        required_tile_keys = ("dem_tile_index_layer", "dem_tile_field", "dem_file_pattern")
+        missing_tile_keys = [k for k in required_tile_keys if not spec.get(k)]
+        if missing_tile_keys:
+            raise ValueError(
+                f"dem_tile_index_db is set, so these are also required: {missing_tile_keys}"
+            )
 
     # Bounding-box buffer applied around the finest level's local basin
     # before clipping, as a fraction of that basin's width/height (0.10 = 10%).
     spec.setdefault("dem_clip_buffer_pct", 0.10)
+
+    # Square up the (buffered) clip bbox to its larger dimension, centered
+    # on the same point, before clipping/tile-selection. Default true - an
+    # elongated clip truncates flow accumulation asymmetrically, which can
+    # make the pour-point snap lock onto a small nearby creek instead of
+    # the actual main river (notably for outlets in a floodplain). Set
+    # false to restore the old unsquared rectangular-bbox behavior.
+    spec.setdefault("dem_clip_square", True)
+    if spec["dem_clip_square"] is None:
+        spec["dem_clip_square"] = True
 
     # Pour-point snap search radius, in DEM CELL UNITS (not a real-world
     # distance) - spec-driven so it's easy to tune per DEM, but stays
@@ -80,12 +135,23 @@ def load_spec(spec_path: Path) -> dict:
     spec.setdefault("dem_snap_search_cells", 3)
 
     # Set true if the DEM is already hydrologically conditioned (e.g. MERIT
-    # Hydro's elevation product) - skips fill_pits/fill_depressions/
-    # resolve_flats entirely, saving real time across many outlets. Default
-    # false (also if explicitly null) - conditions the DEM as normal.
+    # Hydro's own pre-conditioned elevation product) - skips fill_pits/
+    # fill_depressions/resolve_flats entirely, saving real time across many
+    # outlets. Default false (also if explicitly null) - conditions the DEM
+    # as normal, which is the safe default for a plain/raw elevation raster.
     spec.setdefault("is_dem_conditioned", False)
     if spec["is_dem_conditioned"] is None:
         spec["is_dem_conditioned"] = False
+
+    # Set true to also write the intermediate flow-direction and flow-
+    # accumulation rasters (and the raw catchment mask) to disk per outlet,
+    # alongside the DEM clip - useful for QA/debugging a specific outlet's
+    # raster delineation. Off by default: these are only intermediate
+    # products, most runs don't need them kept around. Default false (also
+    # if explicitly null).
+    spec.setdefault("export_rasters", False)
+    if spec["export_rasters"] is None:
+        spec["export_rasters"] = False
 
     for i, lvl in enumerate(spec["levels"]):
         for k in ("label", "layer"):
@@ -157,16 +223,21 @@ def load_outlets(gpkg_path: Path, layer: str, outlet_field: str = None,
 
 
 # --------------------------------------------------------------------------
-# Area handling
+# Geometry / area handling
 # --------------------------------------------------------------------------
 
-# Function to remove interior rings
-# Function to remove interior rings
 def remove_holes(geometry):
-    if geometry.geom_type == 'Polygon':
+    """
+    Strip interior rings from a Polygon/MultiPolygon.
+
+    grid.polygonize() on a raster catchment mask can produce spurious tiny
+    holes (isolated nodata/excluded cells fully surrounded by catchment
+    cells) - not real gaps in the catchment, just rasterization noise. Drop
+    them for a clean solid polygon.
+    """
+    if geometry.geom_type == "Polygon":
         return Polygon(geometry.exterior)
-    elif geometry.geom_type == 'MultiPolygon':
-        # Reconstruct MultiPolygons by removing holes from each part
+    elif geometry.geom_type == "MultiPolygon":
         return MultiPolygon([Polygon(g.exterior) for g in geometry.geoms])
     return geometry
 
@@ -200,7 +271,13 @@ def dissolve_with_area(
     if area_field and area_field in gdf.columns:
         aggfunc[area_field] = "sum"
 
-    gdf_dissolved = gdf.dissolve(by="_dissolve_key", aggfunc=aggfunc).reset_index(drop=True)
+    if aggfunc:
+        gdf_dissolved = gdf.dissolve(by="_dissolve_key", aggfunc=aggfunc).reset_index(drop=True)
+    else:
+        # No non-geometry columns at all (e.g. a purely raster-derived piece
+        # with no attributes) - groupby().agg({}) raises "No objects to
+        # concatenate", so skip the dict form and just dissolve geometry.
+        gdf_dissolved = gdf.dissolve(by="_dissolve_key").reset_index(drop=True)
 
     if compute_area_crs:
         area_m2 = gdf_dissolved.geometry.to_crs(compute_area_crs).area
@@ -257,20 +334,66 @@ def _bounds_overlap(a: tuple, b: tuple) -> bool:
     return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
 
 
+def compute_clip_bounds(
+        polygon_gdf: gpd.GeoDataFrame,
+        buffer_pct: float,
+        target_crs=None,
+        square: bool = True,
+) -> tuple:
+    """
+    Compute the final clip bounds for a polygon: buffer first, then
+    (optionally) square up to the LARGER of the two buffered dimensions,
+    centered on the same center point.
+
+    Squaring matters for the raster refinement step specifically: an
+    elongated (non-square) clip extent truncates flow accumulation
+    asymmetrically. A real river running near one edge of a thin
+    rectangular clip loses most of its true upstream contributing area -
+    whatever lies outside the clip in the box's "short" direction - so its
+    computed accumulation comes out artificially low relative to a small,
+    fully-contained tributary nearby. That can make the pour-point snap
+    lock onto the small creek instead of the actual main river, especially
+    for outlets sitting in a floodplain near a big river. A square clip
+    gives more balanced context in both directions, which reduces (though
+    doesn't fully eliminate) that edge-truncation bias.
+    """
+    gdf = polygon_gdf.to_crs(target_crs) if target_crs is not None else polygon_gdf
+    minx, miny, maxx, maxy = gdf.total_bounds
+
+    width = maxx - minx
+    height = maxy - miny
+    minx -= width * buffer_pct
+    maxx += width * buffer_pct
+    miny -= height * buffer_pct
+    maxy += height * buffer_pct
+
+    if square:
+        width = maxx - minx
+        height = maxy - miny
+        side = max(width, height)
+        cx = (minx + maxx) / 2.0
+        cy = (miny + maxy) / 2.0
+        minx, maxx = cx - side / 2.0, cx + side / 2.0
+        miny, maxy = cy - side / 2.0, cy + side / 2.0
+
+    return minx, miny, maxx, maxy
+
+
 def clip_dem_to_bbox(
         dem_path: Path,
         polygon_gdf: gpd.GeoDataFrame,
         dst_path: Path,
         buffer_pct: float = 0.10,
+        square: bool = True,
 ) -> Path:
     """
     Clip a DEM raster to the buffered bounding box of a single polygon.
 
-    Prototype step for a raster-refined "middle" catchment estimate: this
-    ONLY clips, it does not do any flow-direction/accumulation or watershed
-    delineation. Uses a rectangular bbox (not an exact polygon mask) for
-    simplicity, expanded by buffer_pct of that bbox's own width/height in
-    each direction so the clip isn't flush against the local basin's edge.
+    Uses a rectangular bbox (not an exact polygon mask) for simplicity,
+    expanded by buffer_pct of that bbox's own width/height in each
+    direction so the clip isn't flush against the local basin's edge, and
+    (by default) squared up to the larger dimension - see
+    compute_clip_bounds for why that matters for the raster refinement step.
 
     Requires rasterio - imported lazily here so the rest of the script has
     no raster dependency unless this function is actually called.
@@ -285,15 +408,9 @@ def clip_dem_to_bbox(
     from rasterio.windows import from_bounds
 
     with rasterio.open(dem_path) as src:
-        polygon_in_dem_crs = polygon_gdf.to_crs(src.crs)
-        minx, miny, maxx, maxy = polygon_in_dem_crs.total_bounds
-
-        width = maxx - minx
-        height = maxy - miny
-        minx -= width * buffer_pct
-        maxx += width * buffer_pct
-        miny -= height * buffer_pct
-        maxy += height * buffer_pct
+        minx, miny, maxx, maxy = compute_clip_bounds(
+            polygon_gdf, buffer_pct, target_crs=src.crs, square=square,
+        )
 
         if not _bounds_overlap((minx, miny, maxx, maxy), tuple(src.bounds)):
             raise DEMExtentError(
@@ -322,6 +439,101 @@ def clip_dem_to_bbox(
     return dst_path
 
 
+# --------------------------------------------------------------------------
+# Tiled DEM support
+# --------------------------------------------------------------------------
+
+def load_tile_index(gpkg_path: Path, layer: str, tile_field: str) -> gpd.GeoDataFrame:
+    """Read a DEM tile index layer, keeping only the tile code field + geometry."""
+    gdf = gpd.read_file(gpkg_path, layer=layer)[[tile_field, "geometry"]].copy()
+    return gdf
+
+
+class DEMTileError(Exception):
+    """Raised when no DEM tiles intersect a requested extent, or a resolved tile file is missing."""
+
+
+def find_intersecting_tiles(
+        tile_index: gpd.GeoDataFrame,
+        polygon_gdf: gpd.GeoDataFrame,
+        tile_field: str,
+        buffer_pct: float = 0.10,
+        square: bool = True,
+) -> list:
+    """
+    Select-by-location: return the tile codes whose footprint intersects the
+    BUFFERED (and, by default, SQUARED) bounding box of polygon_gdf.
+
+    Uses the exact same compute_clip_bounds math as clip_dem_to_bbox (same
+    buffer_pct, same square flag) so tile selection agrees with what
+    actually gets clipped afterward - selecting against a smaller/unsquared
+    extent could miss a tile the eventual clip needs, leaving a strip of
+    nodata (or a wrongly-truncated accumulation) in the final result.
+    """
+    from shapely.geometry import box
+
+    minx, miny, maxx, maxy = compute_clip_bounds(
+        polygon_gdf, buffer_pct, target_crs=None, square=square,
+    )
+
+    search_box = gpd.GeoDataFrame(
+        geometry=[box(minx, miny, maxx, maxy)], crs=polygon_gdf.crs
+    ).to_crs(tile_index.crs)
+
+    matches = tile_index[tile_index.intersects(search_box.geometry.iloc[0])]
+    return matches[tile_field].unique().tolist()
+
+
+def merge_dem_tiles(
+        dem_dir: Path,
+        tile_codes: list,
+        file_pattern: str,
+        dst_path: Path,
+) -> Path:
+    """
+    Merge (mosaic) one or more DEM tile files into a single raster.
+
+    Builds each tile's path as dem_dir / file_pattern.format(tile=code) and
+    raises DEMTileError if any resolved file is missing. The merged raster
+    is NOT yet clipped to any outlet's extent - that's still done by
+    clip_dem_to_bbox afterward, on this merge's output.
+
+    Requires rasterio - imported lazily, matching clip_dem_to_bbox.
+    """
+    import rasterio
+    from rasterio.merge import merge
+
+    if not tile_codes:
+        raise DEMTileError("no tile codes given to merge")
+
+    tile_paths = []
+    for code in tile_codes:
+        p = dem_dir / file_pattern.format(tile=code)
+        if not p.exists():
+            raise DEMTileError(f"DEM tile file not found: {p} (tile code={code!r})")
+        tile_paths.append(p)
+
+    srcs = [rasterio.open(p) for p in tile_paths]
+    try:
+        mosaic, out_transform = merge(srcs)
+        out_meta = srcs[0].meta.copy()
+        out_meta.update({
+            "driver": "GTiff",
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": out_transform,
+        })
+    finally:
+        for s in srcs:
+            s.close()
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(dst_path, "w", **out_meta) as dst:
+        dst.write(mosaic)
+
+    return dst_path
+
+
 class RasterCatchmentError(Exception):
     """Raised when raster-based catchment delineation fails or produces nothing."""
 
@@ -330,29 +542,30 @@ def derive_raster_catchment(
         dem_clip_path: Path,
         outlet_geom_row: gpd.GeoDataFrame,
         snap_search_cells: int = 3,
+        is_dem_conditioned: bool = False,
+        export_rasters: bool = False,
 ) -> gpd.GeoDataFrame:
     """
     Derive a raster-based catchment polygon from a (small, pre-clipped) DEM
     for a single outlet.
 
     Pipeline: condition (fill pits/depressions, resolve flats - SKIPPED if
-    is_dem_conditioned=True, e.g. for pre-conditioned products like MERIT
-    Hydro) -> D8 flow direction -> flow accumulation -> snap the outlet to
-    the highest-accumulation cell within snap_search_cells of it -> trace
-    the upstream catchment -> polygonize.
+    is_dem_conditioned=True, e.g. for pre-conditioned products) -> D8 flow
+    direction -> flow accumulation -> snap the outlet to the highest-
+    accumulation cell within snap_search_cells of it -> trace the upstream
+    catchment -> polygonize.
 
     snap_search_cells is in DEM CELL UNITS (not a real-world distance) and
     is a true circular (Euclidean) radius, not a square window - so it's
     resolution-independent, and only cells strictly LESS THAN that radius
     away are eligible (corner cells of the surrounding square, and cells
-    exactly at the radius boundary, are excluded).
-    Snapping is "max accumulation within the radius", not "nearest cell
-    above a threshold" - a global percentile/threshold mask is fragile and
-    can snap to a minor noise-driven accumulation blip instead of the real
-    channel. The whole snap + catchment lookup is done in raster index
-    (row/col) space rather than round-tripping through map coordinates,
-    since pysheds' coordinate handling has edge-case rounding issues
-    exactly at pixel-boundary values.
+    exactly at the radius boundary, are excluded). Snapping is "max
+    accumulation within the radius", not "nearest cell above a threshold" -
+    a global percentile/threshold mask is fragile and can snap to a minor
+    noise-driven accumulation blip instead of the real channel. The whole
+    snap + catchment lookup is done in raster index (row/col) space rather
+    than round-tripping through map coordinates, since pysheds' coordinate
+    handling has edge-case rounding issues exactly at pixel-boundary values.
 
     Because the source DEM is only clipped to the finest level's local
     basin, this catchment is truncated at that clip's edge - that's
@@ -360,10 +573,16 @@ def derive_raster_catchment(
     basin than the vector polygon alone, and gets unioned with
     catchment_lower by the caller.
 
+    If export_rasters=True, the flow-direction and flow-accumulation
+    rasters, plus the raw catchment mask, are written alongside
+    dem_clip_path (same directory, "<stem>_ldd.tif" / "<stem>_acc.tif" /
+    "<stem>_catchment_raster.tif") for QA/debugging. Off by default - these
+    are intermediate products most runs don't need to keep.
+
     Requires pysheds - imported lazily. Includes a numpy>=2.0 compatibility
     shim, since pysheds 0.5 calls the since-removed numpy.in1d.
 
-    Returns a single-row GeoDataFrame in the DEM's own CRS.
+    Returns a single-row GeoDataFrame (holes removed) in the DEM's own CRS.
     Raises RasterCatchmentError if delineation produces zero cells or
     polygonize yields nothing (e.g. the snap landed on a pit/sink - which,
     if is_dem_conditioned=True was set on a DEM that actually isn't
@@ -379,19 +598,24 @@ def derive_raster_catchment(
     grid = Grid.from_raster(dem_clip_path)
     dem = grid.read_raster(dem_clip_path)
 
-    # filled
-    inflated = grid.resolve_flats(grid.fill_depressions(grid.fill_pits(dem)))
+    if is_dem_conditioned:
+        inflated = dem
+    else:
+        inflated = grid.resolve_flats(grid.fill_depressions(grid.fill_pits(dem)))
 
     dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
     fdir = grid.flowdir(inflated, dirmap=dirmap)
     acc = grid.accumulation(fdir, dirmap=dirmap)
 
-    # export
-    fdir_path = Path(dem_clip_path).parent / "fdir_pysheds.tif"
-    pysheds.io.to_raster(fdir, str(fdir_path))
-
-    acc_path = Path(dem_clip_path).parent / "acc_pysheds.tif"
-    pysheds.io.to_raster(acc, str(acc_path))
+    if export_rasters:
+        stem = Path(dem_clip_path).stem.replace("_dem_clip", "")
+        parent = Path(dem_clip_path).parent
+        ldd_path = parent / f"{stem}_ldd.tif"
+        acc_path = parent / f"{stem}_acc.tif"
+        pysheds.io.to_raster(fdir, str(ldd_path))
+        pysheds.io.to_raster(acc, str(acc_path))
+        print(f"  exported flow direction -> {ldd_path}")
+        print(f"  exported flow accumulation -> {acc_path}")
 
     outlet_in_dem_crs = outlet_geom_row.to_crs(grid.crs)
     pt = outlet_in_dem_crs.geometry.iloc[0]
@@ -403,8 +627,9 @@ def derive_raster_catchment(
 
     # The slice above is a SQUARE window - its corners sit up to
     # snap_search_cells*sqrt(2) away, well outside the intended radius.
-    # Mask out anything beyond the actual circular (Euclidean) distance so
-    # "radius" means what it says, not "half the side of a bounding box".
+    # Mask out anything at or beyond the actual circular (Euclidean)
+    # distance so "radius" means what it says, not "half the side of a
+    # bounding box" - only strictly-inside cells are eligible.
     rr, cc = _np.meshgrid(
         _np.arange(r0, r1) - row, _np.arange(c0, c1) - col, indexing="ij"
     )
@@ -421,19 +646,18 @@ def derive_raster_catchment(
             f"acc={acc[row_snap, col_snap]:.1f}) - dem_clip_path={dem_clip_path}"
         )
 
-    cat_path = Path(dem_clip_path).parent / "catchment_pysheds.tif"
-    pysheds.io.to_raster(catch.astype("int32"), str(cat_path))
+    if export_rasters:
+        cat_path = parent / f"{stem}_catchment_raster.tif"
+        pysheds.io.to_raster(catch.astype("int32"), str(cat_path))
+        print(f"  exported catchment mask -> {cat_path}")
 
     shapes_gen = grid.polygonize(catch.astype("int32"))
     polys = [shape(geom) for geom, val in shapes_gen if val == 1]
     if not polys:
         raise RasterCatchmentError(f"polygonize produced no polygons - dem_clip_path={dem_clip_path}")
 
-
     gdf_cat = gpd.GeoDataFrame(geometry=polys, crs=grid.crs).dissolve().reset_index(drop=True)
-
-    # Apply the function to the geometry column
-    gdf_cat['geometry'] = gdf_cat['geometry'].apply(remove_holes)
+    gdf_cat["geometry"] = gdf_cat["geometry"].apply(remove_holes)
 
     return gdf_cat
 
@@ -505,12 +729,19 @@ def process_outlet(
         area_units: str = "km2",
         catchment_lower_layer: str = "catchment_lower",
         catchment_upper_layer: str = "catchment_upper",
-        catchment_middle_layer: str = "catchment_middle",
+        catchment_layer: str = "catchment",
+        catchment_acceptable_error_pct: float = 5.0,
         dem_path: Path = None,
+        dem_tile_index: gpd.GeoDataFrame = None,
+        dem_tile_field: str = None,
+        dem_file_pattern: str = None,
         dem_clip_buffer_pct: float = 0.10,
+        dem_clip_square: bool = True,
         dem_snap_search_cells: int = 3,
+        is_dem_conditioned: bool = False,
+        export_rasters: bool = False,
         dry_run: bool = False,
-) -> Path:
+) -> dict:
     """
     Full, self-contained pipeline for ONE outlet: sjoin against every level's
     grid, trace upstream at every level, write every layer, then derive
@@ -529,21 +760,45 @@ def process_outlet(
         beyond it - so this always OVERestimates (or exactly equals) the
         true catchment.
 
-    When area info is available, an approx_pct = 100 * lower/upper is
-    attached to both layers: the closer to 100%, the tighter the bracket.
+    An approx_pct = 100 * lower/upper is computed when area info is
+    available, and drives the final "catchment" layer:
 
-    If dem_path is given, the LAST (finest) level's local basin is used to
-    clip a small DEM extract for this outlet, from which a raster-derived
-    catchment is delineated (fill -> D8 flow direction -> accumulation ->
-    pour-point snap -> trace -> polygonize) and unioned with catchment_lower
-    to produce catchment_middle - a tighter, terrain-following estimate
-    than catchment_upper's coarse local-basin polygon. The raster catchment
-    is truncated at the DEM clip's edge, which is fine: it's guaranteed to
-    still be a more detailed delineation of the local basin than the vector
-    polygon alone.
+    - If (100 - approx_pct) <= catchment_acceptable_error_pct, the vector
+      bracket is already tight enough: catchment = catchment_upper as-is,
+      no raster work at all. This is the whole point of "fast" - only pay
+      for DEM processing on outlets where the vector estimate is loose.
+    - Otherwise, if dem_path is given, the LAST (finest) level's local
+      basin is used to clip a small DEM extract for this outlet, from
+      which a raster-derived catchment is delineated (fill -> D8 flow
+      direction -> accumulation -> pour-point snap -> trace -> polygonize)
+      and unioned with catchment_lower to become the final catchment - a
+      tighter, terrain-following estimate than catchment_upper's coarse
+      local-basin polygon. The raster catchment is truncated at the DEM
+      clip's edge, which is fine: it's guaranteed to still be a more
+      detailed delineation of the local basin than the vector polygon alone.
+    - If dem_path isn't given, or the DEM/raster step fails for any reason,
+      catchment falls back to catchment_upper - always tagged via a
+      catchment_source attribute (vector_upper / raster_refined /
+      vector_upper_fallback_*) so provenance and confidence are traceable.
+
+    If dem_tile_index is also given, dem_path is treated as a folder of DEM
+    tiles rather than one static file: the tile(s) intersecting this
+    outlet's (buffered) clip extent are found via select-by-location against
+    dem_tile_index, merged into one mosaic, and THAT gets clipped instead -
+    same clip_dem_to_bbox as the single-file case either way.
 
     This is intentionally not split into level-wide batches: outlets don't
     interact with each other, so each one runs start to finish on its own.
+
+    Returns a dict (not just the output path) so run() can aggregate every
+    outlet's results into one combined GeoPackage afterward, without
+    re-reading each per-outlet file back off disk:
+        fo: Path to this outlet's own per-outlet GeoPackage.
+        outlet_id, outlet_geom_row: the outlet's id and original point row.
+        gdf_catchment_lower / gdf_catchment_upper / gdf_catchment: the
+            corresponding GeoDataFrames (None if that layer wasn't produced).
+        catchment_source: provenance tag for gdf_catchment (None if
+            gdf_catchment is None).
     """
     outlet_id = outlet_geom_row.iloc[0][field_outlet]
     print(f"\n=== Outlet {outlet_id} ===")
@@ -630,6 +885,7 @@ def process_outlet(
         )
 
     # ---- approximation quality: how close is the lower bound to the upper bound? ----
+    approx_pct = None
     if gdf_catchment_lower is not None and gdf_catchment_upper is not None:
         area_lower = get_area_value(gdf_catchment_lower, area_field, area_units)
         area_upper = get_area_value(gdf_catchment_upper, area_field, area_units)
@@ -658,56 +914,237 @@ def process_outlet(
         else:
             print("  no local basin found, skipping catchment_upper layer")
 
-    # ---- DEM-refined "middle" estimate: clip -> raster catchment -> merge with catchment_lower ----
-    # Uses the FINEST level's local basin (last_level_local) - the tightest extent
-    # available - to keep the raster work small and per-outlet.
-    if dem_path is not None:
-        dem_clip_fo = outlet_dir / f"outlet_{outlet_id}_dem_clip.tif"
+    # ---- decide: is the vector-only upper approximation good enough, or is raster
+    # refinement needed (and available)? Either way, exactly one 'catchment' layer
+    # is the final answer, tagged with catchment_source so provenance is traceable. ----
+    if gdf_catchment_upper is None:
+        print("  no local basin at all - cannot define a catchment for this outlet")
+        return {
+            "fo": fo,
+            "outlet_id": outlet_id,
+            "outlet_geom_row": outlet_geom_row,
+            "gdf_catchment_lower": gdf_catchment_lower,
+            "gdf_catchment_upper": None,
+            "gdf_catchment": None,
+            "catchment_source": None,
+        }
+
+    def _write_catchment(gdf, source, dry_run_note=""):
+        gdf = gdf.copy()
+        gdf["catchment_source"] = source
         if dry_run:
-            print(f"[dry-run] would clip DEM to finest-level local basin -> {dem_clip_fo}")
-            print(f"[dry-run] would derive raster catchment and write layer '{catchment_middle_layer}'")
-        elif last_level_local is not None and len(last_level_local) > 0:
-            try:
-                clip_dem_to_bbox(dem_path, last_level_local, dem_clip_fo, buffer_pct=dem_clip_buffer_pct)
-                print(f"  DEM clipped to finest-level local basin -> {dem_clip_fo}")
-
-                try:
-                    gdf_raster_catchment = derive_raster_catchment(
-                        dem_clip_fo, outlet_geom_row, snap_search_cells=dem_snap_search_cells,
-                    ).to_crs(outlet_geom_row.crs)
-                    print(f"  raster catchment derived ({len(gdf_raster_catchment)} polygon)")
-
-                    middle_pieces = [gdf_raster_catchment]
-                    if gdf_catchment_lower is not None:
-                        middle_pieces.append(gdf_catchment_lower)
-                    gdf_middle_input = pd.concat(middle_pieces).reset_index(drop=True)
-                    gdf_catchment_middle = dissolve_with_area(
-                        gdf_middle_input, area_field=area_field,
-                        compute_area_crs=compute_area_crs, area_units=area_units,
-                    )
-                    gdf_catchment_middle["geometry"] = gdf_catchment_middle["geometry"].apply(remove_holes)
-                    if area_field and not compute_area_crs:
-                        # area_field is an attribute SUM inherited from the vector basins;
-                        # the raster piece has no such attribute, so that sum silently
-                        # excludes its contribution. Only compute_area_crs (fresh geometric
-                        # area on the actual merged polygon) is trustworthy for this layer.
-                        print("  NOTE: area_field on catchment_middle excludes the raster "
-                              "piece's area - set compute_area_crs for an accurate area here")
-                    gdf_catchment_middle.to_file(fo, layer=catchment_middle_layer, driver="GPKG")
-                    print(f"  catchment_middle written")
-                except RasterCatchmentError as e:
-                    print(f"  ERROR: raster catchment derivation failed for outlet {outlet_id}: {e}")
-            except DEMExtentError as e:
-                print(f"  ERROR: DEM clip failed for outlet {outlet_id}, skipping DEM step: {e}")
+            print(f"[dry-run] would write layer '{catchment_layer}' (source={source}){dry_run_note}")
         else:
-            print("  no local basin available - skipping DEM clip")
+            gdf.to_file(fo, layer=catchment_layer, driver="GPKG")
+            print(f"  catchment written (source={source})")
+        return {
+            "fo": fo,
+            "outlet_id": outlet_id,
+            "outlet_geom_row": outlet_geom_row,
+            "gdf_catchment_lower": gdf_catchment_lower,
+            "gdf_catchment_upper": gdf_catchment_upper,
+            "gdf_catchment": gdf,
+            "catchment_source": source,
+        }
 
-    return fo
+    needs_refinement = True
+    if approx_pct is not None:
+        error_pct = 100.0 - approx_pct
+        if error_pct <= catchment_acceptable_error_pct:
+            needs_refinement = False
+            print(f"  vector approximation within tolerance (error={error_pct:.1f}% <= "
+                  f"{catchment_acceptable_error_pct}%) - using catchment_upper as the final catchment")
+        else:
+            print(f"  vector approximation error {error_pct:.1f}% exceeds tolerance "
+                  f"{catchment_acceptable_error_pct}% - refinement needed")
+    else:
+        print("  no lower-bound comparison available - refinement needed")
+
+    if not needs_refinement:
+        return _write_catchment(gdf_catchment_upper, "vector_upper")
+
+    if dem_path is None:
+        print("  no dem_path configured - falling back to catchment_upper as the final "
+              "catchment (lower confidence: tolerance not met and no raster refinement available)")
+        return _write_catchment(gdf_catchment_upper, "vector_upper_fallback_no_dem")
+
+    if dry_run:
+        dem_clip_fo = outlet_dir / f"outlet_{outlet_id}_dem_clip.tif"
+        print(f"[dry-run] would clip DEM to finest-level local basin -> {dem_clip_fo}")
+        return _write_catchment(gdf_catchment_upper, "raster_refined", dry_run_note=" (pending raster refinement)")
+
+    if last_level_local is None or len(last_level_local) == 0:
+        print("  no local basin available - skipping DEM clip, falling back to catchment_upper")
+        return _write_catchment(gdf_catchment_upper, "vector_upper_fallback_no_local_basin")
+
+    # ---- DEM-refined catchment: clip -> raster catchment -> merge with catchment_lower ----
+    # Uses the FINEST level's local basin (last_level_local) - the tightest extent
+    # available - to keep the raster work small and per-outlet. Only reached when the
+    # vector approximation wasn't good enough on its own.
+    dem_clip_fo = outlet_dir / f"outlet_{outlet_id}_dem_clip.tif"
+    try:
+        if dem_tile_index is not None:
+            tile_codes = find_intersecting_tiles(
+                dem_tile_index, last_level_local, dem_tile_field,
+                buffer_pct=dem_clip_buffer_pct, square=dem_clip_square,
+            )
+            if not tile_codes:
+                raise DEMTileError(
+                    f"no DEM tiles intersect outlet {outlet_id}'s local basin extent "
+                    f"(+ {dem_clip_buffer_pct * 100:.0f}% buffer)"
+                )
+            dem_merged_fo = outlet_dir / f"outlet_{outlet_id}_dem_merged.tif"
+            merge_dem_tiles(Path(dem_path), tile_codes, dem_file_pattern, dem_merged_fo)
+            print(f"  merged {len(tile_codes)} DEM tile(s) {tile_codes} -> {dem_merged_fo}")
+            dem_source = dem_merged_fo
+        else:
+            dem_merged_fo = None
+            dem_source = dem_path
+
+        clip_dem_to_bbox(dem_source, last_level_local, dem_clip_fo,
+                          buffer_pct=dem_clip_buffer_pct, square=dem_clip_square)
+        print(f"  DEM clipped to finest-level local basin -> {dem_clip_fo}")
+
+        # The merge can cover a lot more area than the final small clip (a
+        # multi-tile mosaic, e.g. several MERIT Hydro tiles) - it's pure
+        # intermediate scratch once the clip exists, so always remove it
+        # (regardless of export_rasters, which only governs the other
+        # debug rasters - ldd/acc/catchment_raster).
+        if dem_merged_fo is not None:
+            dem_merged_fo.unlink(missing_ok=True)
+            print(f"  removed intermediate merged DEM -> {dem_merged_fo}")
+
+        try:
+            gdf_raster_catchment = derive_raster_catchment(
+                dem_clip_fo, outlet_geom_row,
+                snap_search_cells=dem_snap_search_cells,
+                is_dem_conditioned=is_dem_conditioned,
+                export_rasters=export_rasters,
+            ).to_crs(outlet_geom_row.crs)
+            print(f"  raster catchment derived ({len(gdf_raster_catchment)} polygon)")
+
+            refined_pieces = [gdf_raster_catchment]
+            if gdf_catchment_lower is not None:
+                refined_pieces.append(gdf_catchment_lower)
+            gdf_refined_input = pd.concat(refined_pieces).reset_index(drop=True)
+            gdf_catchment = dissolve_with_area(
+                gdf_refined_input, area_field=area_field,
+                compute_area_crs=compute_area_crs, area_units=area_units,
+            )
+            gdf_catchment["geometry"] = gdf_catchment["geometry"].apply(remove_holes)
+            if area_field and not compute_area_crs:
+                # area_field is an attribute SUM inherited from the vector basins;
+                # the raster piece has no such attribute, so that sum silently
+                # excludes its contribution. Only compute_area_crs (fresh geometric
+                # area on the actual merged polygon) is trustworthy for this layer.
+                print("  NOTE: area_field on catchment excludes the raster piece's "
+                      "area - set compute_area_crs for an accurate area here")
+            return _write_catchment(gdf_catchment, "raster_refined")
+        except RasterCatchmentError as e:
+            print(f"  ERROR: raster catchment derivation failed for outlet {outlet_id}: {e}")
+            print("  falling back to catchment_upper as the final catchment")
+            return _write_catchment(gdf_catchment_upper, "vector_upper_fallback_raster_failed")
+    except (DEMExtentError, DEMTileError) as e:
+        print(f"  ERROR: DEM step failed for outlet {outlet_id}: {e}")
+        print("  falling back to catchment_upper as the final catchment")
+        return _write_catchment(gdf_catchment_upper, "vector_upper_fallback_dem_failed")
 
 
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
+
+def build_aggregated_output(
+        outlet_results: list,
+        outlet_field: str,
+        area_field: str,
+        area_units: str,
+        dst_path: Path,
+) -> Path | None:
+    """
+    Collect every outlet's process_outlet() result into one combined
+    GeoPackage in dst_dir, instead of leaving the final answer scattered
+    across one folder per outlet.
+
+    Writes up to 4 layers:
+        outlets: one point per outlet, with 'area', 'area_upper',
+            'area_lower' (from catchment / catchment_upper / catchment_lower
+            respectively - get_area_value's usual area_field-then-
+            area_computed_* preference applies) plus catchment_source.
+        catchment / catchment_upper / catchment_lower: one polygon per
+            outlet that produced that layer, keyed by outlet_field so they
+            join back to the outlets layer (or each other) in GIS software.
+
+    catchment_lower is legitimately absent for headwater outlets (no
+    upstream at any level) - those rows just don't appear in that layer,
+    everything else is unaffected.
+
+    Per-outlet folders (level*_local, DEM clips, etc.) are left in place
+    for QA/debugging - this is a supplementary "final answer" file, not a
+    replacement for them.
+
+    Returns dst_path, or None if there were no successful outlets to
+    aggregate at all.
+    """
+    outlet_rows, catchment_rows, upper_rows, lower_rows = [], [], [], []
+
+    for r in outlet_results:
+        outlet_id = r["outlet_id"]
+        gdf_catchment = r["gdf_catchment"]
+        gdf_upper = r["gdf_catchment_upper"]
+        gdf_lower = r["gdf_catchment_lower"]
+
+        area = get_area_value(gdf_catchment, area_field, area_units) if gdf_catchment is not None else None
+        area_upper = get_area_value(gdf_upper, area_field, area_units) if gdf_upper is not None else None
+        area_lower = get_area_value(gdf_lower, area_field, area_units) if gdf_lower is not None else None
+
+        outlet_row = r["outlet_geom_row"].copy()
+        outlet_row["area"] = area
+        outlet_row["area_upper"] = area_upper
+        outlet_row["area_lower"] = area_lower
+        outlet_row["catchment_source"] = r["catchment_source"]
+        outlet_rows.append(outlet_row)
+
+        if gdf_catchment is not None:
+            row = gdf_catchment[["geometry", "catchment_source"]].copy()
+            row[outlet_field] = outlet_id
+            catchment_rows.append(row)
+        if gdf_upper is not None:
+            row = gdf_upper[["geometry"]].copy()
+            row[outlet_field] = outlet_id
+            upper_rows.append(row)
+        if gdf_lower is not None:
+            row = gdf_lower[["geometry"]].copy()
+            row[outlet_field] = outlet_id
+            lower_rows.append(row)
+
+    if not outlet_rows:
+        print("\nNo successful outlets to aggregate - skipping combined output.")
+        return None
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    gdf_outlets_agg = pd.concat(outlet_rows).reset_index(drop=True)
+    gdf_outlets_agg.to_file(dst_path, layer="outlets", driver="GPKG")
+
+    if catchment_rows:
+        pd.concat(catchment_rows).reset_index(drop=True).to_file(
+            dst_path, layer="catchment", driver="GPKG"
+        )
+    if upper_rows:
+        pd.concat(upper_rows).reset_index(drop=True).to_file(
+            dst_path, layer="catchment_upper", driver="GPKG"
+        )
+    if lower_rows:
+        pd.concat(lower_rows).reset_index(drop=True).to_file(
+            dst_path, layer="catchment_lower", driver="GPKG"
+        )
+
+    print(f"\nAggregated output written -> {dst_path} "
+          f"({len(outlet_rows)} outlet(s), "
+          f"{len(catchment_rows)} catchment, {len(upper_rows)} upper, {len(lower_rows)} lower)")
+    return dst_path
+
 
 def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     src_dir = Path(spec["src_dir"])
@@ -721,9 +1158,24 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     area_field = spec["area_field"]
     compute_area_crs = spec["compute_area_crs"]
     area_units = spec["area_units"]
+    catchment_acceptable_error_pct = spec["catchment_acceptable_error_pct"]
     dem_path = Path(spec["dem_path"]) if spec["dem_path"] else None
+    dem_tile_field = spec["dem_tile_field"]
+    dem_file_pattern = spec["dem_file_pattern"]
     dem_clip_buffer_pct = spec["dem_clip_buffer_pct"]
+    dem_clip_square = spec["dem_clip_square"]
     dem_snap_search_cells = spec["dem_snap_search_cells"]
+    is_dem_conditioned = spec["is_dem_conditioned"]
+    export_rasters = spec["export_rasters"]
+
+    # Tile index is shared, read-only reference data - load it once, up
+    # front, same as the basin grids below.
+    dem_tile_index = None
+    if spec["dem_tile_index_db"] is not None:
+        dem_tile_index = load_tile_index(
+            Path(spec["dem_tile_index_db"]), spec["dem_tile_index_layer"], dem_tile_field,
+        )
+        print(f"\n=== DEM tile index loaded: {len(dem_tile_index)} tile(s) ===")
 
     gdf_outlets = load_outlets(
         src_db, spec["outlets_layer"], outlet_field=outlet_field, outlet_id=outlet_id
@@ -745,13 +1197,13 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
         print(f"\n=== Grid loaded: {label} ===")
         print(gdf_grid.info())
 
-    outputs = []
+    outlet_results = []
     failed = []
     for idx in gdf_outlets.index:
         outlet_geom_row = gdf_outlets.loc[[idx]]
         outlet_id = outlet_geom_row.iloc[0][outlet_field]
         try:
-            fo = process_outlet(
+            result = process_outlet(
                 outlet_geom_row=outlet_geom_row,
                 grids=grids,
                 levels_spec=spec["levels"],
@@ -763,12 +1215,19 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
                 area_field=area_field,
                 compute_area_crs=compute_area_crs,
                 area_units=area_units,
+                catchment_acceptable_error_pct=catchment_acceptable_error_pct,
                 dem_path=dem_path,
+                dem_tile_index=dem_tile_index,
+                dem_tile_field=dem_tile_field,
+                dem_file_pattern=dem_file_pattern,
                 dem_clip_buffer_pct=dem_clip_buffer_pct,
+                dem_clip_square=dem_clip_square,
                 dem_snap_search_cells=dem_snap_search_cells,
+                is_dem_conditioned=is_dem_conditioned,
+                export_rasters=export_rasters,
                 dry_run=dry_run,
             )
-            outputs.append(fo)
+            outlet_results.append(result)
         except Exception as e:
             # Outlets are independent (see process_outlet's docstring) - one
             # failing shouldn't stop the rest of the batch. Fail loudly, then
@@ -779,7 +1238,14 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     if failed:
         print(f"\n{len(failed)} outlet(s) failed: {failed}")
 
-    return outputs
+    if not dry_run:
+        aggregated_path = dst_dir / spec["aggregated_output"]
+        build_aggregated_output(
+            outlet_results, outlet_field, area_field, area_units, aggregated_path,
+        )
+
+    return outlet_results
+
 
 
 # --------------------------------------------------------------------------

@@ -3,7 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 .idea
-
+scripts/
+purge_outputs.py
 CLAUDE.md
 
 specs.local.json
