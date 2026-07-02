@@ -2,6 +2,12 @@
 __pycache__/
 *.py[codz]
 *$py.class
+.idea
+
+CLAUDE.md
+
+specs.local.json
+
 
 # C extensions
 *.so
