@@ -7,16 +7,126 @@ upstream contributing area for each outlet at each level, exports the
 results, and combines the dissolved upstream polygons across all levels
 into a single "full upstream" layer per outlet.
 
-Each outlet is processed as one self-contained pipeline (sjoin -> trace
--> export -> combine, across every level) before moving to the next
-outlet. Outlets don't depend on one another, so there is no level-wide
-batching step; grid layers are simply loaded once up front and reused.
+Each outlet is processed as one self-contained pipeline before moving to
+the next outlet. Outlets don't depend on one another, so there is no
+level-wide batching step; grid layers are simply loaded once up front and
+reused.
+
+This script requires levels to contain EXACTLY 2 entries: [coarsest,
+finest]. Processing is Pfafstetter-driven and fine-level-first:
+
+- The FINE level is always sjoined/traced first. Whether its local basin
+  is a headwater is decided per the headwater_detection spec option:
+  "trace" (default) runs the upstream trace and treats an empty result as
+  headwater (authoritative); "pfaf" reads it a priori from the PFAF code
+  parity via is_headwater() and skips the trace when it says headwater
+  (fast, but only as reliable as the codes). Either way the search_depth
+  PFAF-prefix filter still confines the trace to the coarse parent. An
+  outlet listed in the force_headwaters spec option is forced to headwater
+  regardless of detection (a manual override for cases where inspection
+  showed the automatic result was wrong).
+- If the fine level is a HEADWATER: the outlet's catchment is fully local
+  to that fine sub-basin. No other fine sub-basin feeds it, and - by the
+  same containment logic - no coarse-level upstream basin can reach it
+  either, since any such contribution would have to pass through some
+  fine sub-basin upstream of it, and there isn't one. The coarse level is
+  never even queried. catchment_upper = the fine local basin alone; there
+  is no catchment_lower to bracket it with, so DEM refinement (when a
+  dem_path is configured) is always attempted rather than gated by the
+  usual tolerance check.
+- If the fine level is a TRUNK basin: its upstream fine sub-basins are
+  traced too - but confined to the coarse parent's own territory (via
+  search_depth), never all the way up the wider river network. The coarse
+  level is then also checked:
+    - coarse HEADWATER: nothing more to add. catchment_upper = fine local
+      + fine upstream (dissolved). catchment_lower = fine upstream
+      (dissolved) alone.
+    - coarse TRUNK: the coarse level's own upstream (dissolved) is folded
+      in too. catchment_upper = fine local + fine upstream (dissolved) +
+      coarse upstream (dissolved) - note the coarse LOCAL basin itself is
+      deliberately NOT included, since fine local + fine upstream already
+      cover that same extent at finer resolution. catchment_lower = fine
+      upstream (dissolved) + coarse upstream (dissolved) only (no local
+      basin at either scale).
+  The usual acceptable-error tolerance then decides whether DEM
+  refinement is needed, same as before.
+- Whenever DEM refinement runs, the FINE level's local basin is always the
+  clip extent - raster resolution happens at fine scale in every case.
+- Two manual per-outlet overrides (by outlet id) bypass the automatic
+  decisions above, for outlets where inspection showed the automatic
+  result was wrong: force_headwaters forces an outlet to be treated as a
+  fine-level headwater; force_upper forces catchment_upper as the final
+  result and skips raster resolution entirely (useful in flat plains where
+  DEM delineation mis-aligns).
 
 Usage:
 
     python get_catchments_fast.py --spec spec.json
     python get_catchments_fast.py --spec spec.json --outlet-id 3
     python get_catchments_fast.py --spec spec.json --dry-run
+
+Spec file (JSON). Required keys are marked; everything else is optional
+and falls back to the default shown. 'levels' must contain EXACTLY 2
+entries, ordered [coarsest, finest]:
+
+    {
+        "src_dir":        "data/in",              // required
+        "dst_dir":        "data/out",             // required
+        "src_db":         "basins.gpkg",          // required (filename in src_dir)
+
+        "outlets_layer":  "outlets",              // required
+        "outlet_field":   "outlet_id",            // required (unique id per outlet point)
+
+        "id_field":       "HYBAS_ID",             // required (basin id)
+        "id_down_field":  "NEXT_DOWN",            // required (downstream basin id)
+        "pfaf_field":     "PFAF_ID",              // required (Pfafstetter code)
+        "area_field":     "SUB_AREA",             // required (per-basin area attribute)
+
+        "levels": [                               // required, EXACTLY 2, [coarse, fine]
+            {"label": "lev06", "layer": "hybas_lev06", "search_depth": null},
+            {"label": "lev08", "layer": "hybas_lev08", "search_depth": 6}
+        ],
+
+        // ---- optional: area handling ----
+        "compute_area_crs":               null,   // e.g. "ESRI:102033" for a fresh geometric area
+        "area_units":                     "km2",  // "km2" | "m2"
+        "catchment_acceptable_error_pct": 5.0,    // accept vector upper if lower >= 95% of it
+        "headwater_detection":            "trace",// "trace" (default, authoritative) |
+                                                  //   "pfaf" (fast, trusts PFAF parity) | "auto"
+        "force_headwaters":               null,   // e.g. [3, 17, 42] - outlet ids forced to
+                                                  //   headwater regardless of detection.
+                                                  //   null/absent -> none forced.
+        "force_upper":                    null,   // e.g. [8, 21] - outlet ids forced to the
+                                                  //   upper approximation, skipping raster
+                                                  //   resolution. null/absent -> none forced.
+
+        // ---- optional: outputs (both written to dst_dir) ----
+        "aggregated_output": "catchments.gpkg",   // shared layers, keyed by outlet_field
+        "discrete_output":   null,                // e.g. "database.gpkg" -> one
+                                                  //   catchment_<outlet_id> layer per outlet.
+                                                  //   null/absent -> not written.
+
+        // ---- optional: DEM refinement (single-file mode) ----
+        // omit dem_path entirely to disable raster refinement (outlets that
+        // fail the tolerance check just fall back to catchment_upper).
+        "dem_path":            null,              // one DEM raster, OR a folder (tiled mode below)
+        "dem_clip_buffer_pct": 0.10,              // buffer around fine local basin before clipping
+        "dem_clip_square":     true,              // square up the clip bbox (see compute_clip_bounds)
+        "dem_snap_search_cells": 3,               // pour-point snap radius, in DEM cells
+        "is_dem_conditioned":  false,             // true skips fill/resolve (pre-conditioned DEMs)
+        "export_rasters":      false,             // true keeps intermediate ldd/acc/mask rasters
+
+        // ---- optional: DEM refinement (tiled mode) ----
+        // set dem_tile_index_db to switch dem_path to a FOLDER of tiles; then
+        // dem_tile_index_layer / dem_tile_field / dem_file_pattern are ALSO required.
+        "dem_tile_index_db":    null,             // gpkg holding the tile footprints
+        "dem_tile_index_layer": null,             // layer name within that gpkg
+        "dem_tile_field":       null,             // column holding each tile's code
+        "dem_file_pattern":     null              // e.g. "{tile}_dem.tif" (formatted with tile code)
+    }
+
+Note: the block above is annotated with // comments for readability;
+strict JSON does not allow comments, so a real spec.json must omit them.
 
 """
 import argparse
@@ -64,7 +174,10 @@ def load_spec(spec_path: Path) -> dict:
 
     # Optional: an equal-area CRS (e.g. "ESRI:102033" for South America Albers
     # Equal Area Conic). When set, a fresh geometric area is also computed on
-    # every dissolved polygon, in the units below.
+    # every dissolved polygon, in the units below. Note: a raster-refined
+    # catchment ALWAYS gets a geometric area regardless of this setting (its
+    # attribute area is untrustworthy) - this CRS is used for it when set,
+    # otherwise that area is measured geodesically on the WGS84 ellipsoid.
     spec.setdefault("compute_area_crs", None)
     spec.setdefault("area_units", "km2")
     if spec["area_units"] not in ("km2", "m2"):
@@ -78,12 +191,89 @@ def load_spec(spec_path: Path) -> dict:
     # for raster processing on outlets where the vector bracket is too loose.
     spec.setdefault("catchment_acceptable_error_pct", 5.0)
 
+    # How to decide whether a basin is a headwater (no upstream) at a given
+    # level. Pfafstetter codes give an a priori answer without tracing, but
+    # can be unreliable where the PFAF system has errors/simplifications -
+    # so the default is the slower-but-authoritative trace check.
+    #   "trace" (default): always run the upstream trace and treat an empty
+    #       result as headwater. Ignores PFAF parity for this decision even
+    #       though codes are present. The authoritative path.
+    #   "pfaf": use is_headwater() on the outlet's PFAF code and SKIP the
+    #       upstream trace entirely when it reports headwater - the fast,
+    #       "lazy" path, only as trustworthy as the PFAF codes themselves.
+    #   "auto": use PFAF if a pfaf_field is available, else fall back to
+    #       trace. Since pfaf_field is currently mandatory (it also drives
+    #       search_depth), this is effectively identical to "pfaf" today;
+    #       kept for forward-compatibility if pfaf_field ever becomes
+    #       optional.
+    # Note: PFAF codes are still used for the search_depth prefix filter
+    # regardless of this setting - this only governs headwater detection.
+    spec.setdefault("headwater_detection", "trace")
+    if spec["headwater_detection"] is None:
+        spec["headwater_detection"] = "trace"
+    if spec["headwater_detection"] not in ("trace", "pfaf", "auto"):
+        raise ValueError(
+            "headwater_detection must be 'trace', 'pfaf', or 'auto' - "
+            f"got {spec['headwater_detection']!r}"
+        )
+
+    # Optional: a hand-curated list of outlet ids (integers) FORCED to be
+    # treated as headwater catchments, overriding whatever headwater_detection
+    # would otherwise conclude for them. Intended for outlets where visual
+    # inspection of earlier runs showed the automatic trace/pfaf result was
+    # wrong - e.g. a spurious downstream link in the basin network pulling in
+    # area that isn't really upstream. A forced outlet skips its fine-level
+    # upstream trace entirely and takes the fine local basin as
+    # catchment_upper, exactly like a naturally-detected headwater (so the
+    # coarse level is never queried, there is no lower bound, and raster
+    # refinement runs whenever a DEM is configured). Absent or null -> no
+    # outlet is forced.
+    spec.setdefault("force_headwaters", None)
+    if spec["force_headwaters"] is None:
+        spec["force_headwaters"] = []
+    try:
+        spec["force_headwaters"] = [int(v) for v in spec["force_headwaters"]]
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "force_headwaters must be a list of integer outlet ids - "
+            f"got {spec['force_headwaters']!r}"
+        ) from e
+
+    # Optional: a hand-curated list of outlet ids (integers) whose result is
+    # FORCED to be the vector upper approximation (catchment_upper), skipping
+    # raster resolution entirely. Intended for outlets - typically in flat
+    # plains - where DEM-based delineation is known to mis-align (the pour
+    # point won't snap to the right channel, the catchment leaks across a
+    # near-flat divide, etc.) and the vector upper bound is the more
+    # trustworthy answer. Overrides both the tolerance check and DEM
+    # availability. Absent or null -> no outlet is forced.
+    spec.setdefault("force_upper", None)
+    if spec["force_upper"] is None:
+        spec["force_upper"] = []
+    try:
+        spec["force_upper"] = [int(v) for v in spec["force_upper"]]
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "force_upper must be a list of integer outlet ids - "
+            f"got {spec['force_upper']!r}"
+        ) from e
+
     # Filename (not full path) for the combined output GeoPackage, written
     # to dst_dir once all outlets are processed. Collects every outlet's
     # final catchment/catchment_upper/catchment_lower into single layers,
     # plus an 'outlets' layer with area/area_upper/area_lower attributes -
     # a single-file summary instead of hunting through per-outlet folders.
     spec.setdefault("aggregated_output", "catchments.gpkg")
+
+    # Optional filename (not full path) for a "discrete" output GeoPackage,
+    # written to dst_dir alongside aggregated_output. Instead of one shared
+    # 'catchment' layer keyed by outlet id, this writes each outlet's FINAL
+    # catchment to its own layer named 'catchment_<outlet_id>' - handy for
+    # eyeballing/QA one outlet at a time in GIS without them stacked in a
+    # single layer. Only the final catchment goes here (not the
+    # upper/lower brackets); outlets that produced no catchment get no
+    # layer. Null/absent -> not written at all.
+    spec.setdefault("discrete_output", None)
 
     # Optional: path to an EXISTING DEM raster (e.g. a MERIT Hydro tile).
     # Only used if the vector approximation isn't within
@@ -159,6 +349,17 @@ def load_spec(spec_path: Path) -> dict:
                 raise ValueError(f"levels[{i}] is missing required key '{k}'")
         lvl.setdefault("search_depth", None)
 
+    # The fine-then-coarse Pfafstetter branching in process_outlet is defined
+    # strictly in terms of "the coarse level" and "the fine level" - it does
+    # not generalize to a longer ladder. Fail fast at spec-load time rather
+    # than letting an N-level spec silently run with undefined behavior.
+    if len(spec["levels"]) != 2:
+        raise ValueError(
+            "'levels' must contain exactly 2 entries - [coarsest, finest] - "
+            f"for this script's Pfafstetter fine-then-coarse logic. Got "
+            f"{len(spec['levels'])}: {[lvl.get('label') for lvl in spec['levels']]}"
+        )
+
     return spec
 
 
@@ -223,6 +424,30 @@ def load_outlets(gpkg_path: Path, layer: str, outlet_field: str = None,
 
 
 # --------------------------------------------------------------------------
+# Pfafstetter logic
+# --------------------------------------------------------------------------
+
+def is_headwater(pfaf_code: str) -> bool:
+    """
+    True if pfaf_code is a Pfafstetter headwater/tributary basin.
+
+    Rule: the first non-zero digit counting from the right is even.
+    Trailing zeros are unused finer-level digits (no subdivision occurred
+    under this basin), not meaningful for parity, so they're stripped
+    first. A headwater basin has, by construction, no other basin at this
+    same level flowing into it - so its upstream is guaranteed empty
+    without needing to trace anything.
+
+    Raises ValueError if pfaf_code is all zeros (no non-zero digit at all -
+    not a valid Pfafstetter code to classify).
+    """
+    stripped = pfaf_code.rstrip("0")
+    if not stripped:
+        raise ValueError(f"pfaf_code is all zeros: {pfaf_code!r}")
+    return int(stripped[-1]) % 2 == 0
+
+
+# --------------------------------------------------------------------------
 # Geometry / area handling
 # --------------------------------------------------------------------------
 
@@ -240,6 +465,32 @@ def remove_holes(geometry):
     elif geometry.geom_type == "MultiPolygon":
         return MultiPolygon([Polygon(g.exterior) for g in geometry.geoms])
     return geometry
+
+
+def count_polygons(geometry) -> int:
+    """
+    Count the number of disjoint polygon parts in a geometry.
+
+    A clean catchment should be a single contiguous polygon (returns 1).
+    More than one part is a quality-control red flag: it usually means the
+    dissolve left disconnected pieces - e.g. a mis-snapped pour point that
+    delineated an unrelated basin, a search_depth prefix that missed part
+    of the true upstream network, or a raster catchment truncated into
+    islands at the DEM clip edge. Surfaced as the 'n_polygons' attribute so
+    suspicious outlets can be filtered/reviewed after a run.
+
+    Returns 0 for a None or empty geometry.
+    """
+    if geometry is None or geometry.is_empty:
+        return 0
+    gt = geometry.geom_type
+    if gt == "Polygon":
+        return 1
+    if gt == "MultiPolygon":
+        return len(geometry.geoms)
+    if gt == "GeometryCollection":
+        return sum(count_polygons(g) for g in geometry.geoms)
+    return 0
 
 
 def dissolve_with_area(
@@ -301,6 +552,35 @@ def get_area_value(gdf: gpd.GeoDataFrame, area_field: str = None, area_units: st
     if computed_col in gdf.columns:
         return float(gdf[computed_col].iloc[0])
     return None
+
+
+def compute_geometric_area(gdf: gpd.GeoDataFrame, area_units: str = "km2",
+                           area_crs: str = None) -> float:
+    """
+    Geometric area of a GeoDataFrame's polygon(s), summed, in km2 or m2.
+
+    This is the authoritative area for geometry that has no reliable
+    attribute area to sum - notably a raster-refined catchment, whose
+    raster piece carries geometry but no area_field value, so an attribute
+    sum silently omits it (or is absent entirely).
+
+    If area_crs is given, area is measured after reprojecting to it - use an
+    equal-area CRS (e.g. "ESRI:102033") for a meaningful number. If not,
+    area is measured geodesically on the WGS84 ellipsoid, which needs no
+    CRS choice and is accurate anywhere; the geometry is reprojected to
+    EPSG:4326 first when its own CRS is projected. A geographic CRS (or a
+    missing CRS, assumed lon/lat) is fed to the geodesic calc directly.
+    """
+    if area_crs:
+        area_m2 = float(gdf.geometry.to_crs(area_crs).area.sum())
+    else:
+        from pyproj import Geod
+        geoms = gdf.geometry
+        if gdf.crs is not None and gdf.crs.is_projected:
+            geoms = geoms.to_crs("EPSG:4326")
+        geod = Geod(ellps="WGS84")
+        area_m2 = float(sum(abs(geod.geometry_area_perimeter(g)[0]) for g in geoms))
+    return area_m2 / 1e6 if area_units == "km2" else area_m2
 
 
 def reattach_fields(
@@ -675,28 +955,83 @@ def trace_upstream_at_level(
         pfaf_field: str,
         search_depth: int,
         area_field: str = None,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+        headwater_detection: str = "trace",
+        force_headwater: bool = False,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, bool]:
     """
     Trace the upstream area for a single outlet at a single grid level.
 
-    The Pfafstetter prefix filter (search_depth) is applied here: it narrows
-    the search grid to only basins sharing the outlet's own PFAF_ID prefix
-    before the upstream trace runs, which is what keeps this tractable on
-    large/fine-resolution levels.
+    The Pfafstetter prefix filter (search_depth) is always applied here
+    regardless of headwater_detection: it narrows the search grid to only
+    basins sharing the outlet's own PFAF_ID prefix before the upstream
+    trace runs, which is what keeps this tractable on large/fine levels.
 
-    Returns (gdf_local, gdf_upstream). gdf_upstream may be empty.
+    force_headwater, when True, overrides ALL detection: the outlet is
+    treated as a headwater unconditionally, the upstream trace is skipped,
+    and (empty upstream, True) is returned. This is how the spec's
+    force_headwaters list is honored - a manual override for outlets where
+    visual inspection showed the automatic result was wrong. It takes
+    precedence over headwater_detection entirely.
+
+    Otherwise headwater_detection selects HOW the returned is_headwater
+    flag is decided:
+      - "pfaf": classify the outlet's own (untruncated) PFAF code via
+        is_headwater(). When it reports headwater, the upstream is empty
+        by construction, so the potentially expensive
+        get_upstream_features_iterative() call is SKIPPED outright. Fast,
+        but only as trustworthy as the PFAF codes. A missing/null PFAF
+        code falls through to tracing rather than being assumed headwater.
+      - "trace" (default) / "auto": always run the upstream trace and
+        treat an empty result as headwater. Authoritative, ignores PFAF
+        parity for this decision. ("auto" behaves as "pfaf" only when a
+        usable PFAF code is present, else as "trace" - identical to
+        "trace" whenever the code is missing.)
+
+    Returns (gdf_local, gdf_upstream, is_headwater). gdf_upstream is empty
+    whenever is_headwater is True. The caller uses is_headwater to decide
+    whether the outlet is fully local - see process_outlet.
     """
     start_id = outlet_row[field_id]
+    pfaf_code = outlet_row[pfaf_field]
     print(f"[{label}] Local basin ID: {start_id}")
 
+    has_pfaf = pfaf_code is not None and not pd.isna(pfaf_code)
+
+    # PFAF shortcut is used only in "pfaf" mode (or "auto" when a code is
+    # present). In "trace" mode we never trust parity - we trace and look.
+    use_pfaf_shortcut = has_pfaf and headwater_detection in ("pfaf", "auto")
+
+    # search_depth prefix filter - always applied when configured, needs a
+    # usable PFAF code to slice.
     gdf_grid_search = gdf_grid
     if search_depth is not None:
-        pfaf_prefix = outlet_row[pfaf_field][:search_depth]
-        print(f"[{label}] PFAF full/prefix: {outlet_row[pfaf_field]} / {pfaf_prefix}")
-        mask = gdf_grid[pfaf_field].str.startswith(pfaf_prefix)
-        gdf_grid_search = gdf_grid.query("@mask")
+        if not has_pfaf:
+            print(f"[{label}] WARNING: search_depth={search_depth} set but no usable "
+                  f"PFAF code on this outlet - skipping prefix filter, tracing full grid")
+        else:
+            pfaf_prefix = pfaf_code[:search_depth]
+            print(f"[{label}] PFAF prefix (search): {pfaf_prefix}")
+            mask = gdf_grid[pfaf_field].str.startswith(pfaf_prefix)
+            gdf_grid_search = gdf_grid.query("@mask")
 
     gdf_local = gdf_grid_search.query(f"{field_id} == {start_id}").copy()
+
+    # Manual override (spec force_headwaters) beats all detection: treat as
+    # headwater, skip the trace entirely, ignore any PFAF parity.
+    if force_headwater:
+        print(f"[{label}] FORCED headwater by spec (force_headwaters) - "
+              f"skipping upstream trace, ignoring detection")
+        gdf_upstream = gdf_grid_search.iloc[0:0].copy()
+        return gdf_local, gdf_upstream, True
+
+    if use_pfaf_shortcut:
+        headwater = is_headwater(pfaf_code)
+        print(f"[{label}] PFAF: {pfaf_code} -> "
+              f"{'headwater' if headwater else 'interbasin/trunk'} (mode={headwater_detection})")
+        if headwater:
+            print(f"[{label}] headwater by PFAF - skipping upstream trace")
+            gdf_upstream = gdf_grid_search.iloc[0:0].copy()
+            return gdf_local, gdf_upstream, True
 
     gdf_upstream = get_upstream_features_iterative(
         features=gdf_grid_search,
@@ -710,9 +1045,18 @@ def trace_upstream_at_level(
     # from the search grid before it's lost for good.
     gdf_upstream = reattach_fields(gdf_upstream, gdf_grid_search, field_id, [area_field])
 
-    print(f"[{label}] Number of upstream basins: {len(gdf_upstream)}")
+    n_upstream = len(gdf_upstream)
+    print(f"[{label}] Number of upstream basins: {n_upstream}")
 
-    return gdf_local, gdf_upstream
+    # In trace/auto mode, headwater status IS the trace result: empty
+    # upstream means nothing flows in. (In pfaf mode we only reach here
+    # when the code already said trunk, so an empty trace still correctly
+    # reports headwater=True - the trace is the tie-breaker either way.)
+    headwater = n_upstream == 0
+    if headwater:
+        print(f"[{label}] empty upstream - headwater by trace")
+
+    return gdf_local, gdf_upstream, headwater
 
 
 def process_outlet(
@@ -731,6 +1075,9 @@ def process_outlet(
         catchment_upper_layer: str = "catchment_upper",
         catchment_layer: str = "catchment",
         catchment_acceptable_error_pct: float = 5.0,
+        headwater_detection: str = "trace",
+        force_headwaters=None,
+        force_upper=None,
         dem_path: Path = None,
         dem_tile_index: gpd.GeoDataFrame = None,
         dem_tile_field: str = None,
@@ -743,43 +1090,42 @@ def process_outlet(
         dry_run: bool = False,
 ) -> dict:
     """
-    Full, self-contained pipeline for ONE outlet: sjoin against every level's
-    grid, trace upstream at every level, write every layer, then derive
-    bracketing catchment estimates — all before moving on to the next outlet.
+    Full, self-contained pipeline for ONE outlet. Processing is Pfafstetter-
+    driven and fine-level-first - see the module docstring for the full
+    rationale. In short:
 
-    catchment_lower: dissolved union of every level's *upstream-only* basins
-        (local basin excluded everywhere). This always UNDERestimates the
-        true catchment, since it's missing the local basin's own
-        contribution entirely.
+    1. The FINE level (levels_spec[1]) is always sjoined and traced first.
+    2. If the fine local basin is a HEADWATER (by headwater_detection, or
+       forced via the outlet appearing in force_headwaters): the coarse
+       level is never even queried. catchment_upper = fine local basin
+       alone. catchment_lower = None (no lower bound exists to bracket
+       with). DEM refinement, when configured, is always attempted rather
+       than gated by the tolerance check, since there's nothing to check
+       against.
+    3. If the fine local basin is a TRUNK basin: its upstream fine
+       sub-basins are traced too (confined to the coarse parent's own
+       territory via search_depth). The coarse level (levels_spec[0]) is
+       then sjoined and traced:
+         - coarse HEADWATER: catchment_upper = fine local + fine upstream
+           (dissolved). catchment_lower = fine upstream (dissolved) alone.
+         - coarse TRUNK: catchment_upper = fine local + fine upstream
+           (dissolved) + coarse upstream (dissolved) - the coarse LOCAL
+           basin itself is deliberately excluded, since fine local + fine
+           upstream already cover that same extent at finer resolution.
+           catchment_lower = fine upstream (dissolved) + coarse upstream
+           (dissolved) only (no local basin at either scale).
+       The usual acceptable-error tolerance then decides whether DEM
+       refinement is needed.
 
-    catchment_upper: dissolved union of the FIRST (coarsest) level's local
-        basin + that same level's upstream. Because every finer level's
-        search space is restricted to the coarsest level's own PFAF prefix,
-        the coarsest local basin already contains all finer-level detail
-        near the outlet, and its own upstream trace covers everything
-        beyond it - so this always OVERestimates (or exactly equals) the
-        true catchment.
-
-    An approx_pct = 100 * lower/upper is computed when area info is
-    available, and drives the final "catchment" layer:
-
-    - If (100 - approx_pct) <= catchment_acceptable_error_pct, the vector
-      bracket is already tight enough: catchment = catchment_upper as-is,
-      no raster work at all. This is the whole point of "fast" - only pay
-      for DEM processing on outlets where the vector estimate is loose.
-    - Otherwise, if dem_path is given, the LAST (finest) level's local
-      basin is used to clip a small DEM extract for this outlet, from
-      which a raster-derived catchment is delineated (fill -> D8 flow
-      direction -> accumulation -> pour-point snap -> trace -> polygonize)
-      and unioned with catchment_lower to become the final catchment - a
-      tighter, terrain-following estimate than catchment_upper's coarse
-      local-basin polygon. The raster catchment is truncated at the DEM
-      clip's edge, which is fine: it's guaranteed to still be a more
-      detailed delineation of the local basin than the vector polygon alone.
-    - If dem_path isn't given, or the DEM/raster step fails for any reason,
-      catchment falls back to catchment_upper - always tagged via a
-      catchment_source attribute (vector_upper / raster_refined /
-      vector_upper_fallback_*) so provenance and confidence are traceable.
+    Whenever DEM refinement runs, the FINE level's local basin is always
+    the clip extent - raster resolution happens at fine scale in every
+    case, unioned with catchment_lower (if any) to become the final
+    catchment. catchment falls back to catchment_upper if dem_path isn't
+    given or the DEM/raster step fails for any reason - always tagged via
+    a catchment_source attribute (vector_upper / vector_upper_forced /
+    raster_refined / vector_upper_fallback_*) so provenance and confidence
+    are traceable. An outlet listed in the force_upper spec option skips
+    raster resolution outright and is tagged vector_upper_forced.
 
     If dem_tile_index is also given, dem_path is treated as a folder of DEM
     tiles rather than one static file: the tile(s) intersecting this
@@ -803,86 +1149,156 @@ def process_outlet(
     outlet_id = outlet_geom_row.iloc[0][field_outlet]
     print(f"\n=== Outlet {outlet_id} ===")
 
-    outlet_dir = dst_dir / f"outlet_{outlet_id}"
+    outlet_dir = dst_dir / "outlets" / f"outlet_{outlet_id}"
     fo = outlet_dir / f"outlet_{outlet_id}.gpkg"
 
     if not dry_run:
         outlet_dir.mkdir(parents=True, exist_ok=True)
         outlet_geom_row.to_file(fo, layer="outlet", driver="GPKG")
 
-    dissolved_pieces = []
-    first_level_local = None
-    first_level_upstream_dissolved = None
-    last_level_local = None
+    # Manual headwater override for this outlet (spec force_headwaters).
+    # numpy int outlet ids compare/hash equal to plain ints, so a direct
+    # membership test works; guard the int() cast for non-numeric ids.
+    force_fine_headwater = False
+    if force_headwaters:
+        try:
+            force_fine_headwater = int(outlet_id) in force_headwaters
+        except (TypeError, ValueError):
+            force_fine_headwater = outlet_id in force_headwaters
+    if force_fine_headwater:
+        print(f"  outlet {outlet_id} is in force_headwaters - forcing headwater catchment")
 
-    for i, lvl in enumerate(levels_spec):
-        label = lvl["label"]
-        gdf_grid = grids[label]
+    force_upper_this = False
+    if force_upper:
+        try:
+            force_upper_this = int(outlet_id) in force_upper
+        except (TypeError, ValueError):
+            force_upper_this = outlet_id in force_upper
+    if force_upper_this:
+        print(f"  outlet {outlet_id} is in force_upper - will force upper approximation "
+              f"(raster resolution skipped)")
 
-        gdf_point_joined = gpd.sjoin(
-            left_df=outlet_geom_row, right_df=gdf_grid, how="left"
+    coarse_lvl, fine_lvl = levels_spec[0], levels_spec[1]
+
+    # ---- Step 1: FINE level, always sjoined and traced first ----
+    gdf_fine_grid = grids[fine_lvl["label"]]
+    gdf_fine_joined = gpd.sjoin(left_df=outlet_geom_row, right_df=gdf_fine_grid, how="left")
+    fine_outlet_row = gdf_fine_joined.iloc[0].to_dict()
+
+    fine_local, fine_upstream, fine_headwater = trace_upstream_at_level(
+        outlet_row=fine_outlet_row,
+        gdf_grid=gdf_fine_grid,
+        label=fine_lvl["label"],
+        field_id=field_id,
+        field_id_down=field_id_down,
+        pfaf_field=pfaf_field,
+        search_depth=fine_lvl["search_depth"],
+        area_field=area_field,
+        headwater_detection=headwater_detection,
+        force_headwater=force_fine_headwater,
+    )
+
+    if len(fine_local) == 0:
+        print("  no local basin found at the fine level - cannot define a catchment for this outlet")
+        return {
+            "fo": fo,
+            "outlet_id": outlet_id,
+            "outlet_geom_row": outlet_geom_row,
+            "gdf_catchment_lower": None,
+            "gdf_catchment_upper": None,
+            "gdf_catchment": None,
+            "catchment_source": None,
+        }
+
+    fine_n = len(fine_upstream)
+    fine_upstream_dissolved = None
+    if fine_n > 0:
+        fine_upstream_dissolved = dissolve_with_area(
+            fine_upstream, area_field=area_field,
+            compute_area_crs=compute_area_crs, area_units=area_units,
         )
-        outlet_row = gdf_point_joined.iloc[0].to_dict()
 
-        gdf_local, gdf_upstream = trace_upstream_at_level(
-            outlet_row=outlet_row,
-            gdf_grid=gdf_grid,
-            label=label,
+    if dry_run:
+        print(f"[dry-run] would write layers: {fine_lvl['label']}_local"
+              + (f", {fine_lvl['label']}_upstream, {fine_lvl['label']}_upstream_dissolved" if fine_n > 0 else ""))
+    else:
+        fine_local.to_file(fo, layer=f"{fine_lvl['label']}_local", driver="GPKG")
+        if fine_n > 0:
+            fine_upstream.to_file(fo, layer=f"{fine_lvl['label']}_upstream", driver="GPKG")
+            fine_upstream_dissolved.to_file(fo, layer=f"{fine_lvl['label']}_upstream_dissolved", driver="GPKG")
+
+    # ---- Step 2: branch on the fine level's own headwater status ----
+    if fine_headwater:
+        # No other fine sub-basin feeds this one, and - by the same
+        # containment logic - no coarse-level upstream basin can reach it
+        # either (it would have to pass through some fine sub-basin
+        # upstream of this one, and there isn't one). The coarse level is
+        # never even queried.
+        print(f"  [{fine_lvl['label']}] headwater - outlet is fully local, "
+              f"skipping the coarse level entirely")
+        gdf_catchment_upper = dissolve_with_area(
+            fine_local, area_field=area_field,
+            compute_area_crs=compute_area_crs, area_units=area_units,
+        )
+        gdf_catchment_lower = None
+    else:
+        # ---- Step 2b: coarse level, only reached when the fine level is a trunk basin ----
+        gdf_coarse_grid = grids[coarse_lvl["label"]]
+        gdf_coarse_joined = gpd.sjoin(left_df=outlet_geom_row, right_df=gdf_coarse_grid, how="left")
+        coarse_outlet_row = gdf_coarse_joined.iloc[0].to_dict()
+
+        coarse_local, coarse_upstream, coarse_headwater = trace_upstream_at_level(
+            outlet_row=coarse_outlet_row,
+            gdf_grid=gdf_coarse_grid,
+            label=coarse_lvl["label"],
             field_id=field_id,
             field_id_down=field_id_down,
             pfaf_field=pfaf_field,
-            search_depth=lvl["search_depth"],
+            search_depth=coarse_lvl["search_depth"],
             area_field=area_field,
+            headwater_detection=headwater_detection,
         )
-        n = len(gdf_upstream)
-
-        gdf_upstream_dissolved = None
-        if n > 0:
-            gdf_upstream_dissolved = dissolve_with_area(
-                gdf_upstream, area_field=area_field,
+        coarse_n = len(coarse_upstream)
+        coarse_upstream_dissolved = None
+        if coarse_n > 0:
+            coarse_upstream_dissolved = dissolve_with_area(
+                coarse_upstream, area_field=area_field,
                 compute_area_crs=compute_area_crs, area_units=area_units,
             )
-            dissolved_pieces.append(gdf_upstream_dissolved)
-
-        if i == 0:
-            first_level_local = gdf_local
-            first_level_upstream_dissolved = gdf_upstream_dissolved
-        last_level_local = gdf_local  # overwritten each loop - ends up as the finest level's
 
         if dry_run:
-            print(f"[dry-run] would write layers: {label}_local"
-                  + (f", {label}_upstream, {label}_upstream_dissolved" if n > 0 else ""))
-            continue
+            print(f"[dry-run] would write layers: {coarse_lvl['label']}_local"
+                  + (f", {coarse_lvl['label']}_upstream, {coarse_lvl['label']}_upstream_dissolved" if coarse_n > 0 else ""))
+        else:
+            coarse_local.to_file(fo, layer=f"{coarse_lvl['label']}_local", driver="GPKG")
+            if coarse_n > 0:
+                coarse_upstream.to_file(fo, layer=f"{coarse_lvl['label']}_upstream", driver="GPKG")
+                coarse_upstream_dissolved.to_file(fo, layer=f"{coarse_lvl['label']}_upstream_dissolved", driver="GPKG")
 
-        gdf_local.to_file(fo, layer=f"{label}_local", driver="GPKG")
+        upper_pieces = [fine_local]
+        lower_pieces = []
+        if fine_upstream_dissolved is not None:
+            upper_pieces.append(fine_upstream_dissolved)
+            lower_pieces.append(fine_upstream_dissolved)
 
-        if n > 0:
-            gdf_upstream.to_file(fo, layer=f"{label}_upstream", driver="GPKG")
-            gdf_upstream_dissolved.to_file(fo, layer=f"{label}_upstream_dissolved", driver="GPKG")
+        if coarse_headwater:
+            print(f"  [{coarse_lvl['label']}] headwater - no coarse-level upstream to add")
+        else:
+            print(f"  [{coarse_lvl['label']}] trunk/interbasin - folding in coarse-level upstream")
+            if coarse_upstream_dissolved is not None:
+                upper_pieces.append(coarse_upstream_dissolved)
+                lower_pieces.append(coarse_upstream_dissolved)
 
-    # ---- catchment_lower: union of every level's upstream-only pieces ----
-    gdf_catchment_lower = None
-    if dissolved_pieces:
-        gdf_pieces = pd.concat(dissolved_pieces).reset_index(drop=True)
-        gdf_catchment_lower = dissolve_with_area(
-            gdf_pieces, area_field=area_field,
-            compute_area_crs=compute_area_crs, area_units=area_units,
-        )
-
-    # ---- catchment_upper: coarsest (first) level's local basin + its own upstream ----
-    upper_pieces = []
-    if first_level_local is not None and len(first_level_local) > 0:
-        upper_pieces.append(first_level_local)
-    if first_level_upstream_dissolved is not None:
-        upper_pieces.append(first_level_upstream_dissolved)
-
-    gdf_catchment_upper = None
-    if upper_pieces:
-        gdf_upper_input = pd.concat(upper_pieces).reset_index(drop=True)
         gdf_catchment_upper = dissolve_with_area(
-            gdf_upper_input, area_field=area_field,
+            pd.concat(upper_pieces).reset_index(drop=True), area_field=area_field,
             compute_area_crs=compute_area_crs, area_units=area_units,
         )
+        gdf_catchment_lower = None
+        if lower_pieces:
+            gdf_catchment_lower = dissolve_with_area(
+                pd.concat(lower_pieces).reset_index(drop=True), area_field=area_field,
+                compute_area_crs=compute_area_crs, area_units=area_units,
+            )
 
     # ---- approximation quality: how close is the lower bound to the upper bound? ----
     approx_pct = None
@@ -901,42 +1317,33 @@ def process_outlet(
     if dry_run:
         if gdf_catchment_lower is not None:
             print(f"[dry-run] would write layer '{catchment_lower_layer}'")
-        if gdf_catchment_upper is not None:
-            print(f"[dry-run] would write layer '{catchment_upper_layer}'")
+        print(f"[dry-run] would write layer '{catchment_upper_layer}'")
     else:
         if gdf_catchment_lower is not None:
             gdf_catchment_lower.to_file(fo, layer=catchment_lower_layer, driver="GPKG")
         else:
-            print("  no upstream area at any level, skipping catchment_lower layer")
+            print("  no lower-bound approximation available (fine level is a headwater), "
+                  "skipping catchment_lower layer")
 
-        if gdf_catchment_upper is not None:
-            gdf_catchment_upper.to_file(fo, layer=catchment_upper_layer, driver="GPKG")
-        else:
-            print("  no local basin found, skipping catchment_upper layer")
+        gdf_catchment_upper.to_file(fo, layer=catchment_upper_layer, driver="GPKG")
 
     # ---- decide: is the vector-only upper approximation good enough, or is raster
     # refinement needed (and available)? Either way, exactly one 'catchment' layer
     # is the final answer, tagged with catchment_source so provenance is traceable. ----
-    if gdf_catchment_upper is None:
-        print("  no local basin at all - cannot define a catchment for this outlet")
-        return {
-            "fo": fo,
-            "outlet_id": outlet_id,
-            "outlet_geom_row": outlet_geom_row,
-            "gdf_catchment_lower": gdf_catchment_lower,
-            "gdf_catchment_upper": None,
-            "gdf_catchment": None,
-            "catchment_source": None,
-        }
 
     def _write_catchment(gdf, source, dry_run_note=""):
         gdf = gdf.copy()
         gdf["catchment_source"] = source
+        gdf["n_polygons"] = gdf.geometry.apply(count_polygons).astype(int)
+        n_poly = int(gdf["n_polygons"].iloc[0])
+        if n_poly != 1:
+            print(f"  QC WARNING: catchment has {n_poly} polygon(s) - expected 1 "
+                  f"(disconnected geometry, review this outlet)")
         if dry_run:
             print(f"[dry-run] would write layer '{catchment_layer}' (source={source}){dry_run_note}")
         else:
             gdf.to_file(fo, layer=catchment_layer, driver="GPKG")
-            print(f"  catchment written (source={source})")
+            print(f"  catchment written (source={source}, n_polygons={n_poly})")
         return {
             "fo": fo,
             "outlet_id": outlet_id,
@@ -947,18 +1354,37 @@ def process_outlet(
             "catchment_source": source,
         }
 
-    needs_refinement = True
-    if approx_pct is not None:
-        error_pct = 100.0 - approx_pct
-        if error_pct <= catchment_acceptable_error_pct:
-            needs_refinement = False
-            print(f"  vector approximation within tolerance (error={error_pct:.1f}% <= "
-                  f"{catchment_acceptable_error_pct}%) - using catchment_upper as the final catchment")
-        else:
-            print(f"  vector approximation error {error_pct:.1f}% exceeds tolerance "
-                  f"{catchment_acceptable_error_pct}% - refinement needed")
+    # Manual override (spec force_upper): skip raster resolution entirely and
+    # take catchment_upper as the final answer. For outlets - typically in
+    # flat plains - where raster delineation is known to mis-align and the
+    # vector upper approximation is the more trustworthy result. Beats the
+    # tolerance check and DEM availability alike; tagged distinctly so it's
+    # never confused with a tolerance-pass or a fallback.
+    if force_upper_this:
+        print("  outlet forced to upper approximation (force_upper) - "
+              "skipping raster resolution")
+        return _write_catchment(gdf_catchment_upper, "vector_upper_forced")
+
+    if fine_headwater:
+        # No lower bound exists to compare against, by construction - the
+        # tolerance check is meaningless here. Refinement is used whenever
+        # a DEM is configured; the fine local basin is the fallback.
+        needs_refinement = True
+        print("  fine level headwater - no lower bound to compare against; "
+              "raster refinement is used whenever a DEM is configured")
     else:
-        print("  no lower-bound comparison available - refinement needed")
+        needs_refinement = True
+        if approx_pct is not None:
+            error_pct = 100.0 - approx_pct
+            if error_pct <= catchment_acceptable_error_pct:
+                needs_refinement = False
+                print(f"  vector approximation within tolerance (error={error_pct:.1f}% <= "
+                      f"{catchment_acceptable_error_pct}%) - using catchment_upper as the final catchment")
+            else:
+                print(f"  vector approximation error {error_pct:.1f}% exceeds tolerance "
+                      f"{catchment_acceptable_error_pct}% - refinement needed")
+        else:
+            print("  no lower-bound comparison available - refinement needed")
 
     if not needs_refinement:
         return _write_catchment(gdf_catchment_upper, "vector_upper")
@@ -973,19 +1399,17 @@ def process_outlet(
         print(f"[dry-run] would clip DEM to finest-level local basin -> {dem_clip_fo}")
         return _write_catchment(gdf_catchment_upper, "raster_refined", dry_run_note=" (pending raster refinement)")
 
-    if last_level_local is None or len(last_level_local) == 0:
-        print("  no local basin available - skipping DEM clip, falling back to catchment_upper")
-        return _write_catchment(gdf_catchment_upper, "vector_upper_fallback_no_local_basin")
-
     # ---- DEM-refined catchment: clip -> raster catchment -> merge with catchment_lower ----
-    # Uses the FINEST level's local basin (last_level_local) - the tightest extent
-    # available - to keep the raster work small and per-outlet. Only reached when the
-    # vector approximation wasn't good enough on its own.
+    # Always uses the FINE level's local basin (fine_local, checked non-empty
+    # above) - raster resolution happens at fine scale in every case, keeping
+    # the raster work small and per-outlet. Only reached when the vector
+    # approximation wasn't good enough on its own (or there wasn't one to
+    # check, i.e. the fine-headwater case).
     dem_clip_fo = outlet_dir / f"outlet_{outlet_id}_dem_clip.tif"
     try:
         if dem_tile_index is not None:
             tile_codes = find_intersecting_tiles(
-                dem_tile_index, last_level_local, dem_tile_field,
+                dem_tile_index, fine_local, dem_tile_field,
                 buffer_pct=dem_clip_buffer_pct, square=dem_clip_square,
             )
             if not tile_codes:
@@ -1001,9 +1425,9 @@ def process_outlet(
             dem_merged_fo = None
             dem_source = dem_path
 
-        clip_dem_to_bbox(dem_source, last_level_local, dem_clip_fo,
+        clip_dem_to_bbox(dem_source, fine_local, dem_clip_fo,
                           buffer_pct=dem_clip_buffer_pct, square=dem_clip_square)
-        print(f"  DEM clipped to finest-level local basin -> {dem_clip_fo}")
+        print(f"  DEM clipped to fine-level local basin -> {dem_clip_fo}")
 
         # The merge can cover a lot more area than the final small clip (a
         # multi-tile mosaic, e.g. several MERIT Hydro tiles) - it's pure
@@ -1032,13 +1456,24 @@ def process_outlet(
                 compute_area_crs=compute_area_crs, area_units=area_units,
             )
             gdf_catchment["geometry"] = gdf_catchment["geometry"].apply(remove_holes)
-            if area_field and not compute_area_crs:
-                # area_field is an attribute SUM inherited from the vector basins;
-                # the raster piece has no such attribute, so that sum silently
-                # excludes its contribution. Only compute_area_crs (fresh geometric
-                # area on the actual merged polygon) is trustworthy for this layer.
-                print("  NOTE: area_field on catchment excludes the raster piece's "
-                      "area - set compute_area_crs for an accurate area here")
+
+            # The area_field attribute sum is untrustworthy for a raster-refined
+            # catchment: the raster piece contributes geometry but carries no
+            # area_field value, so the sum silently omits it (or the column is
+            # absent entirely, leaving the area null). Always replace it with a
+            # real geometric area measured on the merged polygon itself - via
+            # compute_area_crs when configured, else geodesically on the WGS84
+            # ellipsoid - and drop the attribute column so get_area_value picks
+            # up this trustworthy value. This guarantees a non-null, correct
+            # area for every raster-derived catchment.
+            geom_area = compute_geometric_area(
+                gdf_catchment, area_units=area_units, area_crs=compute_area_crs,
+            )
+            gdf_catchment = gdf_catchment.drop(columns=[area_field], errors="ignore")
+            gdf_catchment[f"area_computed_{area_units}"] = geom_area
+            print(f"  raster catchment area (geometric"
+                  f"{', ' + compute_area_crs if compute_area_crs else ', geodesic'}): "
+                  f"{geom_area:.4g} {area_units}")
             return _write_catchment(gdf_catchment, "raster_refined")
         except RasterCatchmentError as e:
             print(f"  ERROR: raster catchment derivation failed for outlet {outlet_id}: {e}")
@@ -1070,10 +1505,14 @@ def build_aggregated_output(
         outlets: one point per outlet, with 'area', 'area_upper',
             'area_lower' (from catchment / catchment_upper / catchment_lower
             respectively - get_area_value's usual area_field-then-
-            area_computed_* preference applies) plus catchment_source.
+            area_computed_* preference applies), plus catchment_source and
+            n_polygons (geometry QC: 1 = clean contiguous catchment, >1 =
+            suspicious/disconnected; None if no catchment).
         catchment / catchment_upper / catchment_lower: one polygon per
             outlet that produced that layer, keyed by outlet_field so they
             join back to the outlets layer (or each other) in GIS software.
+            The catchment layer also carries catchment_source and
+            n_polygons.
 
     catchment_lower is legitimately absent for headwater outlets (no
     upstream at any level) - those rows just don't appear in that layer,
@@ -1098,15 +1537,22 @@ def build_aggregated_output(
         area_upper = get_area_value(gdf_upper, area_field, area_units) if gdf_upper is not None else None
         area_lower = get_area_value(gdf_lower, area_field, area_units) if gdf_lower is not None else None
 
+        # n_polygons is a geometry QC flag set on the final catchment by
+        # _write_catchment (1 = clean/contiguous, >1 = suspicious). Read it
+        # straight off the stored column so the outlets summary agrees with
+        # the catchment layer; None when there's no catchment for this outlet.
+        n_polygons = int(gdf_catchment["n_polygons"].iloc[0]) if gdf_catchment is not None else None
+
         outlet_row = r["outlet_geom_row"].copy()
         outlet_row["area"] = area
         outlet_row["area_upper"] = area_upper
         outlet_row["area_lower"] = area_lower
         outlet_row["catchment_source"] = r["catchment_source"]
+        outlet_row["n_polygons"] = n_polygons
         outlet_rows.append(outlet_row)
 
         if gdf_catchment is not None:
-            row = gdf_catchment[["geometry", "catchment_source"]].copy()
+            row = gdf_catchment[["geometry", "catchment_source", "n_polygons"]].copy()
             row[outlet_field] = outlet_id
             catchment_rows.append(row)
         if gdf_upper is not None:
@@ -1146,7 +1592,52 @@ def build_aggregated_output(
     return dst_path
 
 
+def build_discrete_output(
+        outlet_results: list,
+        outlet_field: str,
+        dst_path: Path,
+) -> Path | None:
+    """
+    Write each outlet's FINAL catchment to its own layer in a single
+    GeoPackage, named 'catchment_<outlet_id>'.
+
+    Unlike build_aggregated_output (one shared 'catchment' layer keyed by
+    outlet id), this keeps every outlet's catchment in a separate layer -
+    convenient for QA/eyeballing one outlet at a time in GIS without them
+    stacked together. Only the final catchment is written here, not the
+    upper/lower brackets.
+
+    Outlets that produced no catchment (gdf_catchment is None) get no
+    layer, same as they'd be absent from the aggregated output's shared
+    catchment layer.
+
+    Returns dst_path, or None if there were no catchments to write at all.
+    """
+    written = 0
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for r in outlet_results:
+        gdf_catchment = r["gdf_catchment"]
+        if gdf_catchment is None:
+            continue
+        outlet_id = r["outlet_id"]
+        gdf_catchment.to_file(dst_path, layer=f"catchment_{outlet_id}", driver="GPKG")
+        written += 1
+
+    if written == 0:
+        print("\nNo catchments to write - skipping discrete output.")
+        return None
+
+    print(f"\nDiscrete output written -> {dst_path} "
+          f"({written} catchment layer(s), one per outlet)")
+    return dst_path
+
+
 def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
+    # outlet_id is reused as the loop variable below; capture the original
+    # CLI argument (None = full run, else a single outlet) before that.
+    outlet_id_arg = outlet_id
+
     src_dir = Path(spec["src_dir"])
     dst_dir = Path(spec["dst_dir"])
     src_db = src_dir / spec["src_db"]
@@ -1159,6 +1650,9 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     compute_area_crs = spec["compute_area_crs"]
     area_units = spec["area_units"]
     catchment_acceptable_error_pct = spec["catchment_acceptable_error_pct"]
+    headwater_detection = spec["headwater_detection"]
+    force_headwaters = set(spec["force_headwaters"])
+    force_upper = set(spec["force_upper"])
     dem_path = Path(spec["dem_path"]) if spec["dem_path"] else None
     dem_tile_field = spec["dem_tile_field"]
     dem_file_pattern = spec["dem_file_pattern"]
@@ -1216,6 +1710,9 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
                 compute_area_crs=compute_area_crs,
                 area_units=area_units,
                 catchment_acceptable_error_pct=catchment_acceptable_error_pct,
+                headwater_detection=headwater_detection,
+                force_headwaters=force_headwaters,
+                force_upper=force_upper,
                 dem_path=dem_path,
                 dem_tile_index=dem_tile_index,
                 dem_tile_field=dem_tile_field,
@@ -1238,11 +1735,33 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     if failed:
         print(f"\n{len(failed)} outlet(s) failed: {failed}")
 
+    # Sanity-check the hand-curated force lists against the outlets actually
+    # seen - a forced id that never matched is very likely a typo. Only
+    # meaningful for a full run; a single --outlet-id run naturally sees just
+    # one id, so skip the check there to avoid false alarms.
+    if (force_headwaters or force_upper) and outlet_id_arg is None:
+        seen_ids = set()
+        for oid in gdf_outlets[outlet_field].tolist():
+            try:
+                seen_ids.add(int(oid))
+            except (TypeError, ValueError):
+                seen_ids.add(oid)
+        unseen_hw = sorted(i for i in force_headwaters if i not in seen_ids)
+        if unseen_hw:
+            print(f"\nWARNING: force_headwaters id(s) not found among outlets: {unseen_hw}")
+        unseen_up = sorted(i for i in force_upper if i not in seen_ids)
+        if unseen_up:
+            print(f"\nWARNING: force_upper id(s) not found among outlets: {unseen_up}")
+
     if not dry_run:
         aggregated_path = dst_dir / spec["aggregated_output"]
         build_aggregated_output(
             outlet_results, outlet_field, area_field, area_units, aggregated_path,
         )
+
+        if spec["discrete_output"]:
+            discrete_path = dst_dir / spec["discrete_output"]
+            build_discrete_output(outlet_results, outlet_field, discrete_path)
 
     return outlet_results
 
