@@ -258,6 +258,35 @@ def load_spec(spec_path: Path) -> dict:
             f"got {spec['force_upper']!r}"
         ) from e
 
+    # Optional: a hand-curated list of outlet ids (integers) FORCED to be
+    # treated as fine-level TRUNK/interbasin basins (headwater=False),
+    # overriding whatever headwater_detection would otherwise conclude. The
+    # mirror image of force_headwaters: for outlets where detection wrongly
+    # reported a headwater (empty fine trace) and so skipped the coarse
+    # level, this forces the full trunk path - the fine upstream trace runs
+    # and the coarse level is queried and folded in. Absent or null -> none
+    # forced.
+    spec.setdefault("force_trunk", None)
+    if spec["force_trunk"] is None:
+        spec["force_trunk"] = []
+    try:
+        spec["force_trunk"] = [int(v) for v in spec["force_trunk"]]
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "force_trunk must be a list of integer outlet ids - "
+            f"got {spec['force_trunk']!r}"
+        ) from e
+
+    # force_headwaters and force_trunk are direct opposites - an outlet in
+    # both is a contradictory instruction, so fail loudly rather than
+    # silently pick one.
+    contradictory = set(spec["force_headwaters"]) & set(spec["force_trunk"])
+    if contradictory:
+        raise ValueError(
+            "outlet id(s) appear in BOTH force_headwaters and force_trunk "
+            f"(contradictory): {sorted(contradictory)}"
+        )
+
     # Filename (not full path) for the combined output GeoPackage, written
     # to dst_dir once all outlets are processed. Collects every outlet's
     # final catchment/catchment_upper/catchment_lower into single layers,
@@ -957,6 +986,7 @@ def trace_upstream_at_level(
         area_field: str = None,
         headwater_detection: str = "trace",
         force_headwater: bool = False,
+        force_trunk: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, bool]:
     """
     Trace the upstream area for a single outlet at a single grid level.
@@ -966,12 +996,16 @@ def trace_upstream_at_level(
     basins sharing the outlet's own PFAF_ID prefix before the upstream
     trace runs, which is what keeps this tractable on large/fine levels.
 
-    force_headwater, when True, overrides ALL detection: the outlet is
-    treated as a headwater unconditionally, the upstream trace is skipped,
-    and (empty upstream, True) is returned. This is how the spec's
-    force_headwaters list is honored - a manual override for outlets where
-    visual inspection showed the automatic result was wrong. It takes
-    precedence over headwater_detection entirely.
+    Two manual overrides beat ALL detection (they are mutually exclusive,
+    enforced at spec-load):
+      - force_headwater=True: treat as headwater, skip the trace, return
+        (local, empty, True). For outlets where detection wrongly said
+        trunk.
+      - force_trunk=True: treat as a trunk, i.e. force is_headwater=False.
+        The upstream trace still RUNS (we need its result), but an empty
+        result is no longer reported as headwater - it's returned as a
+        (possibly empty) trunk so the caller proceeds down the coarse-level
+        path. For outlets where detection wrongly said headwater.
 
     Otherwise headwater_detection selects HOW the returned is_headwater
     flag is decided:
@@ -988,8 +1022,9 @@ def trace_upstream_at_level(
         "trace" whenever the code is missing.)
 
     Returns (gdf_local, gdf_upstream, is_headwater). gdf_upstream is empty
-    whenever is_headwater is True. The caller uses is_headwater to decide
-    whether the outlet is fully local - see process_outlet.
+    whenever is_headwater is True (and may also be empty for a force_trunk
+    outlet that genuinely has no upstream). The caller uses is_headwater to
+    decide whether the outlet is fully local - see process_outlet.
     """
     start_id = outlet_row[field_id]
     pfaf_code = outlet_row[pfaf_field]
@@ -1024,7 +1059,10 @@ def trace_upstream_at_level(
         gdf_upstream = gdf_grid_search.iloc[0:0].copy()
         return gdf_local, gdf_upstream, True
 
-    if use_pfaf_shortcut:
+    # PFAF-parity shortcut (pfaf/auto mode): if the code says headwater, the
+    # upstream is empty by construction, so skip the trace. force_trunk
+    # bypasses this (it could early-return a wrong headwater).
+    if use_pfaf_shortcut and not force_trunk:
         headwater = is_headwater(pfaf_code)
         print(f"[{label}] PFAF: {pfaf_code} -> "
               f"{'headwater' if headwater else 'interbasin/trunk'} (mode={headwater_detection})")
@@ -1033,6 +1071,40 @@ def trace_upstream_at_level(
             gdf_upstream = gdf_grid_search.iloc[0:0].copy()
             return gdf_local, gdf_upstream, True
 
+    # Headwater decision (trace/auto mode) is made against the FULL grid, not
+    # the search_depth-constrained subset. A basin is a headwater iff nothing
+    # anywhere drains directly into it - i.e. no row in the full grid has
+    # id_down == start_id. This one-hop test is the exact topological
+    # definition and is cheap (no traversal). Crucially it uses gdf_grid, not
+    # gdf_grid_search: an outlet at the TOP of its PFAF block receives flow
+    # from basins in a DIFFERENT block, which the prefix filter excludes - so
+    # deciding "headwater" from the constrained trace being empty would
+    # wrongly flag every block-boundary trunk as a headwater. The prefix
+    # filter's job is only to bound which upstream basins get COLLECTED, not
+    # whether the basin has any upstream at all.
+    drains_in = bool((gdf_grid[field_id_down] == start_id).any())
+    if force_trunk:
+        headwater = False
+        if not drains_in:
+            print(f"[{label}] FORCED trunk - nothing drains in on the full grid, "
+                  f"but not treated as headwater (coarse level will still be queried)")
+        else:
+            print(f"[{label}] FORCED trunk (and confirmed: basins drain in on full grid)")
+    else:
+        headwater = not drains_in
+        print(f"[{label}] full-grid headwater check: "
+              f"{'headwater (nothing drains in)' if headwater else 'trunk (basins drain in)'}")
+
+    if headwater:
+        # True headwater - no need to run the (constrained) trace, it would
+        # be empty anyway.
+        gdf_upstream = gdf_grid_search.iloc[0:0].copy()
+        return gdf_local, gdf_upstream, True
+
+    # Trunk: collect the upstream area, confined to the search_depth prefix
+    # block (gdf_grid_search) to keep the trace bounded. This is where the
+    # prefix filter legitimately limits scope - the coarse level handles
+    # everything beyond this block.
     gdf_upstream = get_upstream_features_iterative(
         features=gdf_grid_search,
         field_id=field_id,
@@ -1046,15 +1118,14 @@ def trace_upstream_at_level(
     gdf_upstream = reattach_fields(gdf_upstream, gdf_grid_search, field_id, [area_field])
 
     n_upstream = len(gdf_upstream)
-    print(f"[{label}] Number of upstream basins: {n_upstream}")
-
-    # In trace/auto mode, headwater status IS the trace result: empty
-    # upstream means nothing flows in. (In pfaf mode we only reach here
-    # when the code already said trunk, so an empty trace still correctly
-    # reports headwater=True - the trace is the tie-breaker either way.)
-    headwater = n_upstream == 0
-    if headwater:
-        print(f"[{label}] empty upstream - headwater by trace")
+    print(f"[{label}] Number of upstream basins (within block): {n_upstream}")
+    if n_upstream == 0:
+        # Trunk by the full-grid check, but the constrained trace found
+        # nothing - meaning all its inflow comes from OUTSIDE this PFAF block
+        # (a block-boundary trunk). Correct and expected; the coarse level
+        # supplies that upstream area.
+        print(f"[{label}] trunk with no in-block upstream - inflow is from outside "
+              f"this PFAF block (coarse level will supply it)")
 
     return gdf_local, gdf_upstream, headwater
 
@@ -1078,6 +1149,7 @@ def process_outlet(
         headwater_detection: str = "trace",
         force_headwaters=None,
         force_upper=None,
+        force_trunk=None,
         dem_path: Path = None,
         dem_tile_index: gpd.GeoDataFrame = None,
         dem_tile_field: str = None,
@@ -1178,6 +1250,16 @@ def process_outlet(
         print(f"  outlet {outlet_id} is in force_upper - will force upper approximation "
               f"(raster resolution skipped)")
 
+    force_trunk_this = False
+    if force_trunk:
+        try:
+            force_trunk_this = int(outlet_id) in force_trunk
+        except (TypeError, ValueError):
+            force_trunk_this = outlet_id in force_trunk
+    if force_trunk_this:
+        print(f"  outlet {outlet_id} is in force_trunk - forcing trunk (coarse level "
+              f"will be queried even if the fine trace is empty)")
+
     coarse_lvl, fine_lvl = levels_spec[0], levels_spec[1]
 
     # ---- Step 1: FINE level, always sjoined and traced first ----
@@ -1196,6 +1278,7 @@ def process_outlet(
         area_field=area_field,
         headwater_detection=headwater_detection,
         force_headwater=force_fine_headwater,
+        force_trunk=force_trunk_this,
     )
 
     if len(fine_local) == 0:
@@ -1653,6 +1736,7 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     headwater_detection = spec["headwater_detection"]
     force_headwaters = set(spec["force_headwaters"])
     force_upper = set(spec["force_upper"])
+    force_trunk = set(spec["force_trunk"])
     dem_path = Path(spec["dem_path"]) if spec["dem_path"] else None
     dem_tile_field = spec["dem_tile_field"]
     dem_file_pattern = spec["dem_file_pattern"]
@@ -1713,6 +1797,7 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
                 headwater_detection=headwater_detection,
                 force_headwaters=force_headwaters,
                 force_upper=force_upper,
+                force_trunk=force_trunk,
                 dem_path=dem_path,
                 dem_tile_index=dem_tile_index,
                 dem_tile_field=dem_tile_field,
@@ -1739,7 +1824,7 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     # seen - a forced id that never matched is very likely a typo. Only
     # meaningful for a full run; a single --outlet-id run naturally sees just
     # one id, so skip the check there to avoid false alarms.
-    if (force_headwaters or force_upper) and outlet_id_arg is None:
+    if (force_headwaters or force_upper or force_trunk) and outlet_id_arg is None:
         seen_ids = set()
         for oid in gdf_outlets[outlet_field].tolist():
             try:
@@ -1752,6 +1837,9 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
         unseen_up = sorted(i for i in force_upper if i not in seen_ids)
         if unseen_up:
             print(f"\nWARNING: force_upper id(s) not found among outlets: {unseen_up}")
+        unseen_tr = sorted(i for i in force_trunk if i not in seen_ids)
+        if unseen_tr:
+            print(f"\nWARNING: force_trunk id(s) not found among outlets: {unseen_tr}")
 
     if not dry_run:
         aggregated_path = dst_dir / spec["aggregated_output"]
