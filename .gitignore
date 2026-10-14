@@ -8,7 +8,7 @@ purge_outputs.py
 CLAUDE.md
 
 specs.local.json
-
+*.local.*
 
 # C extensions
 *.so

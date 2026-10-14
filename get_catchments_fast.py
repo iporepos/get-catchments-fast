@@ -58,6 +58,13 @@ finest]. Processing is Pfafstetter-driven and fine-level-first:
   fine-level headwater; force_upper forces catchment_upper as the final
   result and skips raster resolution entirely (useful in flat plains where
   DEM delineation mis-aligns).
+- Two optional topology checks run before dissolving the raster and vector
+  contributions. raster_only_if_disconnected discards the entire vector
+  contribution if any of its polygon components is disconnected from the
+  raster catchment. raster_only_if_low_overlap discards it when the overlap
+  area divided by raster-catchment area is below
+  raster_vector_overlap_threshold (default 0.01, i.e. 1%). Both checks are
+  disabled by default and can be enabled independently in the JSON spec.
 
 Usage:
 
@@ -91,6 +98,9 @@ entries, ordered [coarsest, finest]:
         "compute_area_crs":               null,   // e.g. "ESRI:102033" for a fresh geometric area
         "area_units":                     "km2",  // "km2" | "m2"
         "catchment_acceptable_error_pct": 5.0,    // accept vector upper if lower >= 95% of it
+        "raster_only_if_disconnected":    false,  // discard vector contribution if any component is disconnected
+        "raster_only_if_low_overlap":     false,  // discard vector contribution if overlap with raster is too small
+        "raster_vector_overlap_threshold": 0.01,  // minimum raster-area overlap ratio (0.01 = 1%)
         "headwater_detection":            "trace",// "trace" (default, authoritative) |
                                                   //   "pfaf" (fast, trusts PFAF parity) | "auto"
         "force_headwaters":               null,   // e.g. [3, 17, 42] - outlet ids forced to
@@ -137,6 +147,7 @@ import geopandas as gpd
 import pandas as pd
 import pysheds.io
 from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
 
 from plans.geo import get_upstream_features_iterative
 
@@ -190,6 +201,31 @@ def load_spec(spec_path: Path) -> dict:
     # if a dem_path is configured) - that's the whole point of "fast": only pay
     # for raster processing on outlets where the vector bracket is too loose.
     spec.setdefault("catchment_acceptable_error_pct", 5.0)
+
+    # Optional topology check: when raster and vector contributions contain
+    # spatially disconnected components, retain only the raster contribution.
+    # Disabled by default to preserve existing behavior.
+    spec.setdefault("raster_only_if_disconnected", False)
+
+    if not isinstance(spec["raster_only_if_disconnected"], bool):
+        raise ValueError(
+            "raster_only_if_disconnected must be true or false"
+        )
+
+    # Optional topology check: discard the vector contribution when its
+    # overlap with the raster-derived catchment is below the configured ratio.
+    # The ratio is overlap area divided by raster catchment area; 0.01 means 1%.
+    spec.setdefault("raster_only_if_low_overlap", False)
+    if not isinstance(spec["raster_only_if_low_overlap"], bool):
+        raise ValueError("raster_only_if_low_overlap must be true or false")
+
+    spec.setdefault("raster_vector_overlap_threshold", 0.01)
+    overlap_threshold = spec["raster_vector_overlap_threshold"]
+    if isinstance(overlap_threshold, bool) or not isinstance(overlap_threshold, (int, float)):
+        raise ValueError("raster_vector_overlap_threshold must be a number between 0 and 1")
+    if not 0.0 <= float(overlap_threshold) <= 1.0:
+        raise ValueError("raster_vector_overlap_threshold must be between 0 and 1")
+    spec["raster_vector_overlap_threshold"] = float(overlap_threshold)
 
     # How to decide whether a basin is a headwater (no upstream) at a given
     # level. Pfafstetter codes give an a priori answer without tracing, but
@@ -390,6 +426,117 @@ def load_spec(spec_path: Path) -> dict:
         )
 
     return spec
+
+# --------------------------------------------------------------------------
+# Topology checks
+# --------------------------------------------------------------------------
+
+def has_disconnected_vector_component(
+        gdf_raster: gpd.GeoDataFrame,
+        gdf_vector: gpd.GeoDataFrame,
+) -> bool:
+    """
+    Return True if any polygon component of the vector contribution is
+    spatially disconnected from the raster-derived catchment.
+
+    Polygon components that intersect or touch the raster geometry are
+    considered connected. A vector component that is disjoint from every
+    raster component triggers the check.
+
+    This function does not compare areas or modify either GeoDataFrame.
+    """
+    def polygon_components(geometry):
+        """Recursively extract Polygon components from a geometry."""
+        if geometry is None or geometry.is_empty:
+            return []
+
+        if geometry.geom_type == "Polygon":
+            return [geometry]
+
+        if geometry.geom_type in ("MultiPolygon", "GeometryCollection"):
+            return [
+                part
+                for child in geometry.geoms
+                for part in polygon_components(child)
+            ]
+
+        return []
+
+    raster_geometries = [
+        geom for geom in gdf_raster.geometry
+        if geom is not None and not geom.is_empty
+    ]
+    vector_geometries = [
+        geom for geom in gdf_vector.geometry
+        if geom is not None and not geom.is_empty
+    ]
+
+    # Without geometries from either source, there is no disconnected
+    # vector contribution that this check can reliably identify.
+    if not raster_geometries or not vector_geometries:
+        return False
+
+    raster_union = unary_union(raster_geometries)
+    vector_union = unary_union(vector_geometries)
+
+    vector_components = polygon_components(vector_union)
+
+    # If even one vector component is disconnected from the raster
+    # catchment, flag the entire vector contribution as inconsistent.
+    return any(
+        component.disjoint(raster_union)
+        for component in vector_components
+    )
+
+
+def get_raster_vector_overlap_ratio(
+        gdf_raster: gpd.GeoDataFrame,
+        gdf_vector: gpd.GeoDataFrame,
+        area_units: str = "km2",
+        area_crs: str = None,
+) -> float:
+    """Return intersection area divided by raster-catchment area.
+
+    Both inputs must use the same CRS. Areas are measured with
+    compute_geometric_area(), using area_crs when supplied and otherwise
+    geodesic area on the WGS84 ellipsoid. The ratio is clamped to [0, 1]
+    to absorb tiny floating-point/topological overshoots.
+
+    Returns 0.0 when either input has no usable geometry or the raster area
+    is zero.
+    """
+    raster_geometries = [
+        geom for geom in gdf_raster.geometry
+        if geom is not None and not geom.is_empty
+    ]
+    vector_geometries = [
+        geom for geom in gdf_vector.geometry
+        if geom is not None and not geom.is_empty
+    ]
+    if not raster_geometries or not vector_geometries:
+        return 0.0
+
+    raster_union = unary_union(raster_geometries)
+    vector_union = unary_union(vector_geometries)
+    raster_gdf = gpd.GeoDataFrame(
+        geometry=[raster_union], crs=gdf_raster.crs
+    )
+    raster_area = compute_geometric_area(
+        raster_gdf, area_units=area_units, area_crs=area_crs
+    )
+    if raster_area <= 0.0:
+        return 0.0
+
+    overlap = raster_union.intersection(vector_union)
+    if overlap.is_empty:
+        return 0.0
+    overlap_gdf = gpd.GeoDataFrame(
+        geometry=[overlap], crs=gdf_raster.crs
+    )
+    overlap_area = compute_geometric_area(
+        overlap_gdf, area_units=area_units, area_crs=area_crs
+    )
+    return max(0.0, min(1.0, overlap_area / raster_area))
 
 
 # --------------------------------------------------------------------------
@@ -1146,6 +1293,9 @@ def process_outlet(
         catchment_upper_layer: str = "catchment_upper",
         catchment_layer: str = "catchment",
         catchment_acceptable_error_pct: float = 5.0,
+        raster_only_if_disconnected: bool = False,
+        raster_only_if_low_overlap: bool = False,
+        raster_vector_overlap_threshold: float = 0.01,
         headwater_detection: str = "trace",
         force_headwaters=None,
         force_upper=None,
@@ -1191,13 +1341,21 @@ def process_outlet(
 
     Whenever DEM refinement runs, the FINE level's local basin is always
     the clip extent - raster resolution happens at fine scale in every
-    case, unioned with catchment_lower (if any) to become the final
-    catchment. catchment falls back to catchment_upper if dem_path isn't
+    case, and is combined with catchment_lower (if any) to form the final
+    catchment. Before dissolving, optional topology checks can discard the
+    entire vector contribution: raster_only_if_disconnected rejects it if
+    any vector component is disconnected from the raster catchment;
+    raster_only_if_low_overlap rejects it if intersection area divided by
+    raster-catchment area is below raster_vector_overlap_threshold. The
+    overlap threshold defaults to 0.01 (1%). Both checks are disabled by
+    default. catchment falls back to catchment_upper if dem_path isn't
     given or the DEM/raster step fails for any reason - always tagged via
     a catchment_source attribute (vector_upper / vector_upper_forced /
-    raster_refined / vector_upper_fallback_*) so provenance and confidence
-    are traceable. An outlet listed in the force_upper spec option skips
-    raster resolution outright and is tagged vector_upper_forced.
+    raster_refined / raster_refined_disconnected_vector_dropped /
+    raster_refined_low_overlap_vector_dropped / vector_upper_fallback_*)
+    so provenance and confidence are traceable. An outlet listed in the
+    force_upper spec option skips raster resolution outright and is tagged
+    vector_upper_forced.
 
     If dem_tile_index is also given, dem_path is treated as a folder of DEM
     tiles rather than one static file: the tile(s) intersecting this
@@ -1530,13 +1688,79 @@ def process_outlet(
             ).to_crs(outlet_geom_row.crs)
             print(f"  raster catchment derived ({len(gdf_raster_catchment)} polygon)")
 
-            refined_pieces = [gdf_raster_catchment]
-            if gdf_catchment_lower is not None:
-                refined_pieces.append(gdf_catchment_lower)
-            gdf_refined_input = pd.concat(refined_pieces).reset_index(drop=True)
+            # ---- topology checks: decide whether to retain vector contribution ----
+            drop_vector_contribution = False
+            catchment_source = "raster_refined"
+
+            if gdf_catchment_lower is not None and raster_only_if_disconnected:
+                drop_disconnected_vector = has_disconnected_vector_component(
+                    gdf_raster_catchment,
+                    gdf_catchment_lower,
+                )
+                if drop_disconnected_vector:
+                    print(
+                        "  QC WARNING: vector contribution contains a polygon "
+                        "disconnected from the raster catchment"
+                    )
+                    print(
+                        "  raster_only_if_disconnected=True: discarding the "
+                        "entire vector contribution and retaining raster geometry only"
+                    )
+                    drop_vector_contribution = True
+                    catchment_source = "raster_refined_disconnected_vector_dropped"
+
+            # Only run the overlap test if the vector contribution has not
+            # already been rejected by the disconnected-component test.
+            if (
+                gdf_catchment_lower is not None
+                and raster_only_if_low_overlap
+                and not drop_vector_contribution
+            ):
+                overlap_ratio = get_raster_vector_overlap_ratio(
+                    gdf_raster_catchment,
+                    gdf_catchment_lower,
+                    area_units=area_units,
+                    area_crs=compute_area_crs,
+                )
+                print(
+                    f"  raster/vector overlap ratio: {overlap_ratio:.4%} "
+                    f"(threshold={raster_vector_overlap_threshold:.4%})"
+                )
+                if overlap_ratio < raster_vector_overlap_threshold:
+                    print(
+                        "  QC WARNING: vector contribution overlaps too little "
+                        "of the raster catchment"
+                    )
+                    print(
+                        "  raster_only_if_low_overlap=True: discarding the "
+                        "entire vector contribution and retaining raster geometry only"
+                    )
+                    drop_vector_contribution = True
+                    catchment_source = "raster_refined_low_overlap_vector_dropped"
+
+            if drop_vector_contribution:
+                # Keep every component produced by raster delineation,
+                # including small disconnected raster artifacts.
+                gdf_refined_input = (
+                    gdf_raster_catchment.copy().reset_index(drop=True)
+                )
+            else:
+                # Existing behavior: combine the raster result with the
+                # vector lower-bound contribution, if one exists.
+                refined_pieces = [gdf_raster_catchment]
+                if gdf_catchment_lower is not None:
+                    refined_pieces.append(gdf_catchment_lower)
+                gdf_refined_input = (
+                    pd.concat(refined_pieces).reset_index(drop=True)
+                )
+
+            # Dissolve only after the topology check, so the raster and
+            # vector contributions remain distinguishable during QA.
             gdf_catchment = dissolve_with_area(
-                gdf_refined_input, area_field=area_field,
-                compute_area_crs=compute_area_crs, area_units=area_units,
+                gdf_refined_input,
+                area_field=area_field,
+                compute_area_crs=compute_area_crs,
+                area_units=area_units,
             )
             gdf_catchment["geometry"] = gdf_catchment["geometry"].apply(remove_holes)
 
@@ -1557,7 +1781,7 @@ def process_outlet(
             print(f"  raster catchment area (geometric"
                   f"{', ' + compute_area_crs if compute_area_crs else ', geodesic'}): "
                   f"{geom_area:.4g} {area_units}")
-            return _write_catchment(gdf_catchment, "raster_refined")
+            return _write_catchment(gdf_catchment, catchment_source)
         except RasterCatchmentError as e:
             print(f"  ERROR: raster catchment derivation failed for outlet {outlet_id}: {e}")
             print("  falling back to catchment_upper as the final catchment")
@@ -1733,6 +1957,9 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
     compute_area_crs = spec["compute_area_crs"]
     area_units = spec["area_units"]
     catchment_acceptable_error_pct = spec["catchment_acceptable_error_pct"]
+    raster_only_if_disconnected = spec["raster_only_if_disconnected"]
+    raster_only_if_low_overlap = spec["raster_only_if_low_overlap"]
+    raster_vector_overlap_threshold = spec["raster_vector_overlap_threshold"]
     headwater_detection = spec["headwater_detection"]
     force_headwaters = set(spec["force_headwaters"])
     force_upper = set(spec["force_upper"])
@@ -1794,6 +2021,9 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
                 compute_area_crs=compute_area_crs,
                 area_units=area_units,
                 catchment_acceptable_error_pct=catchment_acceptable_error_pct,
+                raster_only_if_disconnected=raster_only_if_disconnected,
+                raster_only_if_low_overlap=raster_only_if_low_overlap,
+                raster_vector_overlap_threshold=raster_vector_overlap_threshold,
                 headwater_detection=headwater_detection,
                 force_headwaters=force_headwaters,
                 force_upper=force_upper,
