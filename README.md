@@ -83,6 +83,13 @@ python get_catchments_fast.py --spec spec.json --outlet-id 3
 python get_catchments_fast.py --spec spec.json --dry-run
 ```
 
+`--config` is accepted as an alias for `--spec`.
+
+Every log line starts with `[wall clock | % of outlets done]`, and each outlet is
+framed by `>>> outlet i/N | id … | ETA …` and `<<< outlet i/N | id … | ok in …`
+lines. Output is flushed line by line, so `python get_catchments_fast.py --spec spec.json > run.log`
+can be followed live with `tail -f run.log`.
+
 `--dry-run` walks the whole decision logic and prints what would happen, without
 writing or touching any files.
 

@@ -1,11 +1,18 @@
+CLAUDE.md
+prompts/
+.claude/
+*.local*
+scripts/
+archive_*/
+.idea/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
 .idea
-scripts/
 purge_outputs.py
-CLAUDE.md
 
 specs.local.json
 *.local.*

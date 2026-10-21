@@ -72,6 +72,8 @@ Usage:
     python get_catchments_fast.py --spec spec.json --outlet-id 3
     python get_catchments_fast.py --spec spec.json --dry-run
 
+--config is accepted as an alias for --spec.
+
 Spec file (JSON). Required keys are marked; everything else is optional
 and falls back to the default shown. 'levels' must contain EXACTLY 2
 entries, ordered [coarsest, finest]:
@@ -141,6 +143,8 @@ strict JSON does not allow comments, so a real spec.json must omit them.
 """
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
 
 import geopandas as gpd
@@ -150,6 +154,64 @@ from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
 
 from plans.geo import get_upstream_features_iterative
+
+
+# --------------------------------------------------------------------------
+# Logging: side clock and progress counter
+# --------------------------------------------------------------------------
+
+def format_duration(seconds: float) -> str:
+    """Seconds as H:MM:SS (hours grow past 9 as needed)."""
+    seconds = int(round(seconds))
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+# Outlets finished / total, shown in the side column. total stays None
+# until the outlet loop starts, so setup lines show "--" instead of a %.
+PROGRESS = {"done": 0, "total": None}
+
+
+class ClockStream:
+    """
+    Wrap a text stream so every output line starts with a fixed-width
+    '[HH:MM:SS |  xx.x%] ' column: wall-clock time, then the share of outlets
+    finished (from PROGRESS). Applies to everything written - our prints,
+    library output and tracebacks alike - so the column never has gaps.
+    Flushes on every write so a redirected log (e.g. `> run.log`,
+    `tail -f run.log`) stays current instead of sitting in a block buffer.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.at_line_start = True
+
+    def _stamp(self) -> str:
+        if PROGRESS["total"]:
+            pct = f"{PROGRESS['done'] / PROGRESS['total']:.1%}"
+        else:
+            pct = "--"
+        return f"[{time.strftime('%H:%M:%S')} | {pct:>6}] "
+
+    def write(self, text: str) -> int:
+        for piece in text.splitlines(keepends=True):
+            if self.at_line_start:
+                self.stream.write(self._stamp())
+            self.stream.write(piece)
+            self.at_line_start = piece.endswith(("\n", "\r"))
+        self.stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def install_clock() -> None:
+    """Route stdout and stderr through ClockStream."""
+    sys.stdout = ClockStream(sys.stdout)
+    sys.stderr = ClockStream(sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -2004,9 +2066,28 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
 
     outlet_results = []
     failed = []
-    for idx in gdf_outlets.index:
+
+    # Deterministic progress: the outlet count is fixed before the loop, so
+    # every outlet is announced as i/N. The ETA is the mean duration of the
+    # outlets finished so far times the outlets left - rough, since raster
+    # refinement makes some outlets far slower than vector-only ones.
+    n_outlets = len(gdf_outlets)
+    t_loop = time.monotonic()
+    durations = []
+    PROGRESS.update(done=0, total=n_outlets)
+
+    for i, idx in enumerate(gdf_outlets.index, start=1):
         outlet_geom_row = gdf_outlets.loc[[idx]]
         outlet_id = outlet_geom_row.iloc[0][outlet_field]
+
+        if durations:
+            eta = format_duration(sum(durations) / len(durations) * (n_outlets - i + 1))
+        else:
+            eta = "--"
+        print(f"\n>>> outlet {i}/{n_outlets} | id {outlet_id} | ETA {eta}")
+
+        t_outlet = time.monotonic()
+        status = "ok"
         try:
             result = process_outlet(
                 outlet_geom_row=outlet_geom_row,
@@ -2046,6 +2127,16 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
             # move on.
             print(f"\nERROR: outlet {outlet_id} failed and was skipped: {e}")
             failed.append(outlet_id)
+            status = "FAILED"
+
+        durations.append(time.monotonic() - t_outlet)
+        PROGRESS["done"] = i
+        print(f"<<< outlet {i}/{n_outlets} | id {outlet_id} | {status} "
+              f"in {format_duration(durations[-1])}")
+
+    print(f"\n=== {n_outlets} outlet(s) processed in "
+          f"{format_duration(time.monotonic() - t_loop)} "
+          f"({n_outlets - len(failed)} ok, {len(failed)} failed) ===")
 
     if failed:
         print(f"\n{len(failed)} outlet(s) failed: {failed}")
@@ -2093,13 +2184,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Spec-driven upstream basin delineation across a multi-level grid ladder."
     )
-    parser.add_argument("--spec", type=Path, required=True, help="Path to JSON spec file.")
+    parser.add_argument("--spec", "--config", dest="spec", type=Path, required=True,
+                        help="Path to JSON spec file (--config is an alias).")
     parser.add_argument("--outlet-id", default=None, help="Process only this outlet ID.")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without writing files.")
     return parser.parse_args()
 
 
 def main() -> None:
+    install_clock()
     args = parse_args()
     spec = load_spec(args.spec)
     run(spec, outlet_id=args.outlet_id, dry_run=args.dry_run)
