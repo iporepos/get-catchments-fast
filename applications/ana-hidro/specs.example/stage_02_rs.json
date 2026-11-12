@@ -1,0 +1,57 @@
+{
+    "run_name": "calib_rs",
+    "ufs": [
+        "RIO GRANDE DO SUL"
+    ],
+    "stage01_gpkg": "../outputs/stage_01/ana_hidro_stage_01.gpkg",
+    "out_dir": "../outputs/stage_02",
+    "intermediate_dir": "../outputs/stage_02/intermediate",
+    "out_gpkg": "ana_hidro_stage_02_calib_rs.gpkg",
+    "out_report": "report_stage_02_calib_rs.md",
+    "area_flag_ratio": 1.5,
+    "area_flag_bands": [
+        [
+            100,
+            2.0
+        ]
+    ],
+    "gcf_script": "../../../get_catchments_fast.py",
+    "gcf": {
+        "src_dir": "/path/to/data/hydrobasins",
+        "src_db": "hydrobasins_sa_db.gpkg",
+        "id_field": "hybas_id",
+        "id_down_field": "next_down",
+        "pfaf_field": "pfaf_id",
+        "area_field": "sub_area",
+        "levels": [
+            {
+                "label": "level1",
+                "layer": "hybas_sa_lev08_v1c",
+                "search_depth": null
+            },
+            {
+                "label": "level2",
+                "layer": "hybas_sa_lev12_v1c",
+                "search_depth": 8
+            }
+        ],
+        "headwater_detection": "trace",
+        "compute_area_crs": "ESRI:102033",
+        "area_units": "km2",
+        "catchment_acceptable_error_pct": 5,
+        "raster_only_if_disconnected": true,
+        "raster_only_if_low_overlap": true,
+        "raster_vector_overlap_threshold": 0.1,
+        "force_headwaters": [],
+        "force_upper": [],
+        "force_trunk": [],
+        "aggregated_output": "catchments.gpkg",
+        "discrete_output": null,
+        "dem_path": "/path/to/data/hydrosheds/sa_con_3s.tif",
+        "dem_clip_buffer_pct": 2.0,
+        "dem_clip_square": true,
+        "dem_snap_search_cells": 10,
+        "is_dem_conditioned": false,
+        "export_rasters": false
+    }
+}

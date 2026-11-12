@@ -1,0 +1,13 @@
+{
+    "ana_db": "/path/to/data/ANA_HIDRO-WS1_FLU_DAILY.gpkg",
+    "cabra_db": "/path/to/data/ZENODO_CABRA_DAILY.gpkg",
+    "camelsbr_db": "/path/to/data/ZENODO_CAMELS-BR_FLU_DAILY.gpkg",
+    "out_dir": "../outputs/stage_01",
+    "out_gpkg": "ana_hidro_stage_01.gpkg",
+    "out_report": "report_stage_01.md",
+    "buffer_km": 2.0,
+    "camelsbr_min_area_km2": 500.0,
+    "area_flag_ratio": 1.5,
+    "out_crs": "EPSG:4674",
+    "metric_crs": "EPSG:5880"
+}
