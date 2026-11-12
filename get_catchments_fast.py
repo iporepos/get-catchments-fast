@@ -84,6 +84,9 @@ entries, ordered [coarsest, finest]:
         "src_db":         "basins.gpkg",          // required (filename in src_dir)
 
         "outlets_layer":  "outlets",              // required
+        "outlets_db":     null,                   // optional gpkg holding outlets_layer
+                                                  //   (absolute, or relative to src_dir).
+                                                  //   null/absent -> read from src_db.
         "outlet_field":   "outlet_id",            // required (unique id per outlet point)
 
         "id_field":       "HYBAS_ID",             // required (basin id)
@@ -391,6 +394,11 @@ def load_spec(spec_path: Path) -> dict:
     # plus an 'outlets' layer with area/area_upper/area_lower attributes -
     # a single-file summary instead of hunting through per-outlet folders.
     spec.setdefault("aggregated_output", "catchments.gpkg")
+
+    # Optional: a separate GeoPackage holding outlets_layer, so outlet points
+    # don't have to be written into the (shared, read-only) basin database.
+    # Absolute, or relative to src_dir. Null/absent -> outlets come from src_db.
+    spec.setdefault("outlets_db", None)
 
     # Optional filename (not full path) for a "discrete" output GeoPackage,
     # written to dst_dir alongside aggregated_output. Instead of one shared
@@ -2044,8 +2052,9 @@ def run(spec: dict, outlet_id=None, dry_run: bool = False) -> None:
         )
         print(f"\n=== DEM tile index loaded: {len(dem_tile_index)} tile(s) ===")
 
+    outlets_db = src_dir / spec["outlets_db"] if spec["outlets_db"] else src_db
     gdf_outlets = load_outlets(
-        src_db, spec["outlets_layer"], outlet_field=outlet_field, outlet_id=outlet_id
+        outlets_db, spec["outlets_layer"], outlet_field=outlet_field, outlet_id=outlet_id
     )
     print(gdf_outlets)
 

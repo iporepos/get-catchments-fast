@@ -1,0 +1,45 @@
+{
+    "src_dir": "data/in",
+    "dst_dir": "data/out",
+    "src_db": "hydrobasins.gpkg",
+
+    "outlets_layer": "outlets",
+    "outlets_db": null,
+    "outlet_field": "outlet_id",
+
+    "id_field": "HYBAS_ID",
+    "id_down_field": "NEXT_DOWN",
+    "pfaf_field": "PFAF_ID",
+    "area_field": "SUB_AREA",
+
+    "levels": [
+        {"label": "lev08", "layer": "hybas_lev08", "search_depth": null},
+        {"label": "lev12", "layer": "hybas_lev12", "search_depth": 8}
+    ],
+
+    "compute_area_crs": null,
+    "area_units": "km2",
+    "catchment_acceptable_error_pct": 5.0,
+    "raster_only_if_disconnected": false,
+    "raster_only_if_low_overlap": false,
+    "raster_vector_overlap_threshold": 0.01,
+    "headwater_detection": "trace",
+    "force_headwaters": [],
+    "force_upper": [],
+    "force_trunk": [],
+
+    "aggregated_output": "catchments.gpkg",
+    "discrete_output": "catchments_discrete.gpkg",
+
+    "dem_path": "data/dem/dem.tif",
+    "dem_clip_buffer_pct": 0.10,
+    "dem_clip_square": true,
+    "dem_snap_search_cells": 3,
+    "is_dem_conditioned": false,
+    "export_rasters": false,
+
+    "dem_tile_index_db": null,
+    "dem_tile_index_layer": null,
+    "dem_tile_field": null,
+    "dem_file_pattern": null
+}

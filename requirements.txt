@@ -1,0 +1,22 @@
+# get-catchments-fast + scripts/ana-hidro
+# Python 3.12 (tomllib needs >= 3.11). Versions pinned to the environment the
+# ANA-Hidro run was produced with (2026-11).
+
+geopandas==1.1.2
+pandas==3.0.1
+pyarrow==23.0.1
+numpy==2.4.2
+shapely==2.1.2
+pyproj==3.7.2
+pyogrio==0.12.1
+fiona==1.10.1
+rasterio==1.5.0
+scipy==1.18.0
+
+# raster delineation (DEM refinement)
+pysheds==0.5
+numba==0.66.0
+
+# upstream tracing helper used by get_catchments_fast.py (plans.geo)
+# if PyPI does not have it: pip install git+https://github.com/iporepos/plans@v1.2.22
+plans==1.2.22

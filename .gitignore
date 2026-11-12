@@ -6,6 +6,7 @@ scripts/
 specs/
 archive_*/
 .idea/
+outputs/
 
 
 # Byte-compiled / optimized / DLL files
@@ -15,7 +16,7 @@ __pycache__/
 .idea
 purge_outputs.py
 
-specs.local.json
+scripts/atlas-aguas/specs/specs.atlasaguas.local.json
 *.local.*
 
 # C extensions
