@@ -3,6 +3,7 @@ prompts/
 .claude/
 *.local*
 scripts/
+specs/
 archive_*/
 .idea/
 
