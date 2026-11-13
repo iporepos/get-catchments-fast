@@ -8,7 +8,8 @@ Catchment polygons for the ANA-Hidro fluviometric stations of Brazil
 | 1 | reuse published catchments (CABra, then CAMELS-BR) | `stage_01.py` |
 | 2 | delineate the rest with `get_catchments_fast.py`, one run per state | `stage_02.py`, `stage_02_batch.py` |
 | 2b | manual revision per state (edits, forces, copies, replacements, moved outlets) | `stage_02b.py` |
-| 3 | merge everything, final check, append into the ANA database | *not written yet* |
+| 3 | merge Stage 1 + Stage 2b of all runs into one GeoPackage (read only) | `stage_03.py` |
+| 4 | append into the ANA database | *not written yet* |
 
 Everything is driven by JSON configs and reproducible from the command line.
 Run all commands from this folder (`applications/ana-hidro/`).
@@ -262,6 +263,41 @@ with `status_auto`.
 
 ---
 
+## 4b. Stage 3 - merge
+
+```bash
+python stage_03.py --config specs/stage_03.json
+```
+
+Reads Stage 1 and every `outputs/stage_02/<run>/ana_hidro_stage_02b_<run>.gpkg`
+and writes `outputs/stage_03/ana_hidro_stage_03.gpkg` + `report_stage_03.md`
+(rebuilt each run, styled). **It does not write into the ANA database**
+(that is Stage 4). It stops if a code has a catchment in two runs, or in
+Stage 1 and Stage 2b.
+
+| Layer | Content |
+|---|---|
+| `sites_stage03` | all 7,471 stations (ANA points) |
+| `catchments_stage03` | all catchments |
+| `catchments_stage03_<status>` | the same, one layer per final status |
+| `sites_pending_stage_03` | stations without a catchment |
+| `outlets_moved` | moved outlets of all runs (from 2b) |
+
+Sites and catchments have **the same columns**: `name`, `title`, `river`,
+`uf`, `operating`, `telemetric`, `stage` (`stage01` / `stage02b` / `none`),
+`run`, `source`, `catchment_source`, `revision`, `status_stage03`,
+`status_auto`, `status_origin`, `has_catchment`, `area_ana_km2`,
+`area_geod_km2`, `area_ratio_ana`, `area_flag_ratio`, `n_polygons`,
+`area_source_km2` (published area, Stage 1 only).
+
+`status_stage03` = `status_stage02b` for Stage 2b catchments; for Stage 1
+the area check with the Stage 2 tolerance (`area_flag_ratio`,
+`area_flag_bands`). Stage 1 polygons get the Stage 2 sliver cleaning
+(`multipart_drop_pct`, parts < 5% dropped, noted in `revision`). Stations
+without a catchment keep their Stage 2b status (`no hydrobasin`, `pending`).
+
+---
+
 ## 5. Helpers
 
 ```bash
@@ -300,13 +336,16 @@ applications/ana-hidro/
   style_gpkg.py              embed QGIS styles
   join_site_areas.py         area + ratio into sites layers, in place
   synthesis_stage02b.py      status shares + difficulty rank across states
+  stage_03.py                stage 3 merge (read only)
   specs.example/             versioned configs, mock data paths
     stage_01.json
     stage_02_rs.json
+    stage_03.json
   specs/                     your configs (not versioned)
     stage_01.json
     stage_02_rs.json         template for all states
     stage_02/<run>.json      one per state (generated)
+    stage_03.json
   outputs/
     stage_01/                ana_hidro_stage_01.gpkg, report
     stage_02/<run>/          stage 02 gpkg (EDITED BY HAND), stage 02b gpkg, reports,
@@ -318,6 +357,7 @@ applications/ana-hidro/
                              rerun_02b/            forced / moved re-runs (rebuilt by 2b)
     stage_02/batch_logs/     console log per state
     stage_02/synthesis_stage02b.*
+    stage_03/                ana_hidro_stage_03.gpkg, report (rebuildable)
 ```
 
 `get_catchments_fast.py` (repo root) gained an optional `outlets_db` key for
@@ -372,6 +412,7 @@ On the new machine:
 - Stage 2b: run for all states; RS revised (414 / 418 `ok`), other states
   have empty revision files. Algorithm pass rate 81.8% of stations with an
   ANA area (`synthesis_stage02b.md`).
-- Stage 3: to do - merge stage 1 + stage 2b of all states, final check with
-  the area columns of all sources, script to append the catchment layer into
-  the ANA-Hidro database with automatic backup.
+- Stage 3 (2026-11-13): 7,471 stations, 7,467 catchments (970 Stage 1,
+  6,497 Stage 2b), 5,983 `ok` (80.1%), 4 without catchment (`no hydrobasin`).
+- Stage 4: to do - append the catchment layer into the ANA-Hidro database
+  with automatic backup.

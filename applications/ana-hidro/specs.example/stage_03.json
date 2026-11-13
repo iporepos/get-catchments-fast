@@ -1,0 +1,9 @@
+{
+    "stage01_gpkg": "../outputs/stage_01/ana_hidro_stage_01.gpkg",
+    "stage02_dir": "../outputs/stage_02",
+    "out_dir": "../outputs/stage_03",
+    "out_gpkg": "ana_hidro_stage_03.gpkg",
+    "out_report": "report_stage_03.md",
+    "area_flag_ratio": 1.5,
+    "area_flag_bands": [[100, 2.0]]
+}

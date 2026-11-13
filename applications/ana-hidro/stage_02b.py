@@ -87,6 +87,7 @@ Usage:
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -352,7 +353,11 @@ def rerun_forced(cfg: dict, force: dict, points: dict | None = None) -> tuple[gp
     points = points or {}
     codes = sorted(set().union(*force.values()) | set(points))
     rerun_dir = cfg["run_dir"] / "rerun_02b"
-    rerun_dir.mkdir(parents=True, exist_ok=True)
+    # start clean: a previous round's catchments.gpkg would otherwise be read back
+    # as this round's result when every re-run fails (gcf then writes no output)
+    if rerun_dir.exists():
+        shutil.rmtree(rerun_dir)
+    rerun_dir.mkdir(parents=True)
 
     outlets = pd.concat([gpd.read_file(cfg["outlets_gpkg"], layer=lyr)
                          for lyr in ("outlets", "outlets_no_hydrobasin")], ignore_index=True)

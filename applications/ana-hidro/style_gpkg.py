@@ -9,7 +9,7 @@ needed to run this.
 Styles:
   catchments  no fill, light green border 0.3 mm
   sites       2.5 mm circles, white border 0.26 mm, colored by
-              status_stage02b (stage 02b files) or status_stage02:
+              status_stage03, status_stage02b or status_stage02 (first present):
                 ok                      green
                 no ana area             yellow-green
                 multiparts              orange
@@ -18,9 +18,9 @@ Styles:
                 (any other value)       grey
 
 Layers styled (when present in the file):
-  catchments_stage01, catchments_stage02, catchments_stage02b,
-  catchments_stage02b_<status> (per-status split)               -> catchments style
-  sites_stage02(b), sites, sites_pending_stage_02(b)            -> sites style
+  catchments_stage01, catchments_stage02, catchments_stage02b, catchments_stage03,
+  catchments_stage02b_<status>, catchments_stage03_<status>      -> catchments style
+  sites_stage02(b), sites_stage03, sites, sites_pending_*       -> sites style
     (sites layers are styled only if they have a status column)
 
 Note: stage_02.py rewrites its GeoPackage from scratch, so run this again
@@ -34,7 +34,7 @@ import argparse
 import sqlite3
 from pathlib import Path
 
-STATUS_FIELDS = ["status_stage02b", "status_stage02"]  # first one present is used
+STATUS_FIELDS = ["status_stage03", "status_stage02b", "status_stage02"]  # first one present is used
 
 STATUS_COLORS = [  # (value, label, rgb)
     ("ok", "ok", "51,160,44"),
@@ -47,8 +47,9 @@ OTHER_COLOR = "150,150,150"
 
 CATCHMENT_BORDER = "120,220,120"  # light green
 
-CATCHMENT_LAYERS = ["catchments_stage01", "catchments_stage02", "catchments_stage02b"]
-SITE_LAYERS = ["sites_stage02", "sites_stage02b", "sites", "sites_pending_stage_02", "sites_pending_stage_02b"]
+CATCHMENT_LAYERS = ["catchments_stage01", "catchments_stage02", "catchments_stage02b", "catchments_stage03"]
+SITE_LAYERS = ["sites_stage02", "sites_stage02b", "sites_stage03", "sites", "sites_pending_stage_02",
+               "sites_pending_stage_02b", "sites_pending_stage_03"]
 
 QML_HEAD = "<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>\n" \
            '<qgis version="3.34.4-Prizren" styleCategories="Symbology">\n'
@@ -165,7 +166,7 @@ def style_gpkg(path: Path, only_layers: list[str] | None = None) -> list[str]:
     try:
         layers = layer_info(con)
         ensure_layer_styles(con)
-        split = sorted(l for l in layers if l.startswith("catchments_stage02b_"))  # per-status layers
+        split = sorted(l for l in layers if l.startswith(("catchments_stage02b_", "catchments_stage03_")))  # per-status layers
         plan = [(lyr, "catchments") for lyr in CATCHMENT_LAYERS + split] + [(lyr, "sites") for lyr in SITE_LAYERS]
         for lyr, kind in plan:
             if lyr not in layers or (only_layers and lyr not in only_layers):
